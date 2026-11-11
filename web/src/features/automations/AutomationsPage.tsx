@@ -10,12 +10,16 @@
  *
  * 新建与编辑共用 AutomationForm：新建给空表单，编辑按 parseRule 把那条规则回填成同一预设，
  * 提交时带上列表里看到的 updatedAt——期间别人改过就 409，提示刷新而不是把别人的改动盖掉。
+ *
+ * 「最近一次」与投递记录的「结果」都是业务服务补的派生字段：结果不在宿主里，读的是那一轮对话的「每轮汇总」，
+ * 「跳过」是业务侧按「到点时上一轮还在跑」推出来的。有结果就链到那一次的对话——「每次新建对话」的任务
+ * 每一轮都在新对话里，只有这个链接能把人带到对的那一段。
  */
 import { useState } from 'react';
 import { Button } from '@openai/apps-sdk-ui/components/Button';
 import { Warning } from '@openai/apps-sdk-ui/components/Icon';
-import { useSearchParams } from 'react-router';
-import type { Automation, DeliveryRecord } from '../../api/automations';
+import { Link, useSearchParams } from 'react-router';
+import type { Automation, DeliveryRecord, LastRun as LastRunInfo } from '../../api/automations';
 import { readableError } from '../../api/http';
 import { Empty } from '../../ui/Empty';
 import { Sheet } from '../../ui/Sheet';
@@ -25,10 +29,10 @@ import { Tabs } from '../../ui/Tabs';
 import { formatDateTime } from '../../utils/format';
 import { AdminPage, Toolbar } from '../admin/AdminPage';
 import AutomationForm from './AutomationForm';
-import { scheduleText, STATUS_TEXT } from './model';
+import { RUN_STATUS_TEXT, scheduleText, STATUS_TEXT } from './model';
 import { useAutomationHistory, useAutomations } from './queries';
 
-/** 一条任务在表格里的一行：标题、中文时间规则、下次运行时间、状态。 */
+/** 一条任务在表格里的一行：标题、中文时间规则、下次运行、最近一次跑成什么样、状态。 */
 const COLUMNS: readonly Column<Automation>[] = [
   { key: 'title', title: '标题', width: 220, ellipsis: true, render: (task) => task.title },
   { key: 'rule', title: '时间规则', width: 180, ellipsis: true, render: (task) => scheduleText(task.rrule) },
@@ -38,10 +42,31 @@ const COLUMNS: readonly Column<Automation>[] = [
     width: 150,
     render: (task) => <span className="kw-num">{formatDateTime(task.scheduledAt)}</span>,
   },
+  { key: 'lastRun', title: '最近一次', width: 210, render: (task) => <LastRun run={task.lastRun} /> },
   { key: 'status', title: '状态', width: 80, render: (task) => STATUS_TEXT[task.status] },
 ];
 
-/** 一次投递：哪一次、什么时间投的、投到了哪个对话。 */
+/** 最近一次跑成没跑成：跑完/取消/失败 + 那一刻，链到那一次的对话；跳过的没有对话，只有一句说明。 */
+function LastRun({ run }: { readonly run: LastRunInfo | null }) {
+  if (!run) return <span className="kw-secondary">还没有跑过</span>;
+  const text = (
+    <>
+      {RUN_STATUS_TEXT[run.status]} · <span className="kw-num">{formatDateTime(run.at)}</span>
+    </>
+  );
+  if (!run.conversationId) return <span title={run.note ?? undefined}>{text}</span>;
+  return (
+    <Link
+      to={`/chat/${encodeURIComponent(run.conversationId)}`}
+      // 行本身点开投递记录，这一下只去对话，别再冒泡触发一次
+      onClick={(event) => event.stopPropagation()}
+    >
+      {text}
+    </Link>
+  );
+}
+
+/** 一次投递：哪一次、什么时间投的、那一次跑成没跑成、投到了哪个对话。 */
 type RecordRow = DeliveryRecord & { readonly turn: number };
 
 const RECORD_COLUMNS: readonly Column<RecordRow>[] = [
@@ -57,6 +82,13 @@ const RECORD_COLUMNS: readonly Column<RecordRow>[] = [
     title: '计划时间',
     width: 150,
     render: (row) => <span className="kw-num">{formatDateTime(row.scheduledAt)}</span>,
+  },
+  {
+    key: 'result',
+    title: '结果',
+    width: 80,
+    // 合成的那条「跳过」没有 status；真实记录没跑过（没有汇总）时留 —，不写「失败」
+    render: (row) => (row.skipped ? RUN_STATUS_TEXT.skipped : row.status ? RUN_STATUS_TEXT[row.status] : '—'),
   },
   {
     key: 'target',
@@ -190,7 +222,7 @@ function AutomationList({
         rowKey={(task) => task.id}
         columns={columns}
         rows={rows}
-        minWidth={860}
+        minWidth={1070}
         loading={automations.isFetching}
         onRowClick={setOpened}
         empty={all.length === 0 ? '还没有定时任务' : '这一栏里还没有任务'}
@@ -228,7 +260,7 @@ function HistorySheet({ task, onClose }: { readonly task: Automation; readonly o
           columns={RECORD_COLUMNS}
           rows={rows}
           pageSize={false}
-          minWidth={620}
+          minWidth={720}
           empty="这条任务还没有投递过"
           aria-label="投递记录"
         />

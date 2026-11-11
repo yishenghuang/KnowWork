@@ -4,6 +4,10 @@
  * 任务本身存在宿主的官方 schedule 服务里，业务服务只转一手并按调用者筛过，所以这里拿到的都是「我的」；
  * `origin` 是业务服务补的派生字段：这条是「页面上建的」（page）还是「对话里设的提醒」（chat），前端只读它，
  * 不按 target 自己猜（plan-2 §4.4）。
+ *
+ * `lastRun` 与投递记录的 `status` 也是业务服务补的：结果不在宿主里，读的是那一轮对话的「每轮汇总」；
+ * 「跳过」在宿主里根本没有记录（到点时上一轮还在跑），是业务侧按「还在跑 + 已经过点」推出来的。
+ * 这几条字段老版本服务端没有，解析一律容错——缺就是没有，显示成「还没有跑过」，不能让整条任务消失。
  */
 import { request, seg } from './http';
 import { bool, isRecord, listOf, str, text } from './parse';
@@ -15,6 +19,19 @@ export type AutomationStatus = 'active' | 'paused' | 'ended';
 /** 这条任务是从哪来的：页面上建的，还是对话里设的提醒。 */
 export type AutomationOrigin = 'page' | 'chat';
 
+/** 最近一次跑成没跑成：跑完、取消、失败，以及到点时上一轮还在跑而跳过的那一次。 */
+export type RunStatus = 'completed' | 'cancelled' | 'failed' | 'skipped';
+
+/** 这条任务最近一次运行：哪一轮、什么时候、落在哪个对话（跳过没有对话）。 */
+export interface LastRun {
+  readonly status: RunStatus;
+  readonly at: string;
+  readonly conversationId: string | null;
+  readonly title: string | null;
+  /** 为什么跳过之类的一句说明；只有跳过着一次有。 */
+  readonly note: string | null;
+}
+
 /** 一次投递的回执：按计划该在哪一刻跑、实际什么时候投出去、投到了哪个对话。 */
 export interface DeliveryRecord {
   readonly scheduledAt: string | null;
@@ -24,6 +41,11 @@ export interface DeliveryRecord {
   /** 投递目标那个对话的名字（业务服务补的）；会话删了就为空，界面上退回显示 id。 */
   readonly targetTitle: string | null;
   readonly prompt: string;
+  /** 那一次跑成没跑成（该次投递之后那个对话里最近一轮的状态）；读不到时为 null。 */
+  readonly status: RunStatus | null;
+  /** 这一次宿主里没有投递记录，是业务服务按「到点时上一轮还没结束」补出来的那一条。 */
+  readonly skipped: boolean;
+  readonly note: string | null;
 }
 
 export interface Automation {
@@ -39,6 +61,8 @@ export interface Automation {
   readonly origin: AutomationOrigin;
   readonly targetSessionId: string | null;
   readonly lastDelivery: DeliveryRecord | null;
+  /** 最近一次跑成没跑成；还没跑过、或读不到时为 null。 */
+  readonly lastRun: LastRun | null;
   readonly createdAt: string | null;
   readonly updatedAt: string | null;
 }
@@ -85,12 +109,14 @@ export interface AutomationPatch {
 
 const STATUSES: readonly AutomationStatus[] = ['active', 'paused', 'ended'];
 
+const RUN_STATUSES: readonly RunStatus[] = ['completed', 'cancelled', 'failed', 'skipped'];
+
 const base = (path = '') => workspacePath(`/automations${path}`);
 
 function parseDelivery(value: unknown): DeliveryRecord | undefined {
   if (!isRecord(value)) return undefined;
   const messageId = text(value.messageId);
-  // 没有 messageId 的记录分不清是哪一次，直接丢掉比显示半条好
+  // 没有 messageId 的记录分不清是哪一次，直接丢掉比显示半条好；合成的那条「跳过」有 "skipped:..." 的 id
   if (!messageId) return undefined;
   return {
     scheduledAt: text(value.scheduledAt) ?? null,
@@ -99,6 +125,23 @@ function parseDelivery(value: unknown): DeliveryRecord | undefined {
     targetSessionId: text(value.targetSessionId) ?? null,
     targetTitle: text(value.targetTitle) ?? null,
     prompt: str(value.prompt) ?? '',
+    status: RUN_STATUSES.find((s) => s === value.status) ?? null,
+    skipped: bool(value.skipped),
+    note: text(value.note) ?? null,
+  };
+}
+
+/** 最近一次运行：认不出状态就当失败（宁可显示得难看重试，也别当成功），时间不是字符串就整条当没有。 */
+function parseLastRun(value: unknown): LastRun | null {
+  if (!isRecord(value)) return null;
+  const at = text(value.at);
+  if (!at) return null;
+  return {
+    status: RUN_STATUSES.find((s) => s === value.status) ?? 'failed',
+    at,
+    conversationId: text(value.conversationId) ?? null,
+    title: text(value.title) ?? null,
+    note: text(value.note) ?? null,
   };
 }
 
@@ -118,6 +161,7 @@ export function parseAutomation(value: unknown): Automation | undefined {
     origin: value.origin === 'page' ? 'page' : 'chat',
     targetSessionId: target ? (text(target.sessionId) ?? null) : null,
     lastDelivery: parseDelivery(value.lastDelivery) ?? null,
+    lastRun: parseLastRun(value.lastRun),
     createdAt: text(value.createdAt) ?? null,
     updatedAt: text(value.updatedAt) ?? null,
   };

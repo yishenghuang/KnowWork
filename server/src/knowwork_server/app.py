@@ -48,7 +48,7 @@ from .conversations.observers import fan_out
 from .conversations.pump import EventPump
 from .conversations.replay import EventFeed
 from .conversations.service import ConversationService
-from .conversations.summaries import RunSummaries
+from .conversations.summaries import RunSummaries, SummaryQuery
 from .conversations.tool_credentials import ToolCredentials, require_membership
 from .conversations.turn_context import TurnContextHook
 from .conversations.writer import BatchWriter
@@ -187,6 +187,7 @@ class Runtime:
     debug: DebugService
     runs: RunRecords
     insights: InsightsService  # 问答大盘（空间所有者、管理员）
+    summary_query: SummaryQuery  # 自动化页读「最近一次跑成没跑成」用（与运行记录列表同一份汇总）
     channels: Channels  # 渠道：企业微信等机器人
     jobs: JobsAdmin  # 运行面板
     parsers: DocumentParsers  # 文档解析服务的配置
@@ -515,6 +516,7 @@ def build_runtime(settings: Settings, *, extensions: Extensions | None = None) -
                    debug=debug,
                    runs=build_run_records(scoped, models.recorder, debug, service, access, audit.sink,
                                           identity.users.get_many),
+                   summary_query=SummaryQuery(scoped),
                    insights=build_insights(scoped, access, timezone=settings.usage_timezone,
                                            base_names=partial(_base_names, knowledge.service)),
                    channels=build_channels(master_key, scoped, global_sessionmaker, held_engine, access, service,
@@ -581,7 +583,7 @@ def create_public_app(runtime: Runtime) -> FastAPI:
     app.include_router(mention_router(runtime.mention_sources, actor))  # 排在会话路由前，见 mention_api
     app.include_router(conversation_router(runtime.service, actor, runtime.feedback))
     # 自动化页读我的定时任务：任务在宿主里，这里只转达并按执行位置判定视图（见 automations/api.py）
-    app.include_router(automations_router(runtime.kernel, actor, runtime.service))
+    app.include_router(automations_router(runtime.kernel, actor, runtime.service, runs=runtime.summary_query))
     app.include_router(build_answer_modes_router(runtime.answer_modes, actor))
     app.include_router(citations_router(runtime.knowledge.citations, runtime.service, actor, runtime.links))
     app.include_router(debug_router(runtime.debug, runtime.service, actor))

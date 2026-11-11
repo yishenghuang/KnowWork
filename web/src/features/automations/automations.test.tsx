@@ -1,6 +1,8 @@
 /**
- * 「自动化」页：两个视图各列自己的任务、读不到时明确说「暂时读不到」、时间规则的中文说法、点开投递记录。
- * 时间规则的中文描述不单独测 model，按 plan-2 的口径从页面上看（行里写的那句话就是用户看到的那句）。
+ * 「自动化」页：两个视图各列自己的任务、读不到时明确说「暂时读不到」、时间规则的中文说法、点开投递记录，
+ * 以及「最近一次跑成没跑成」——结果由业务服务补在 lastRun 上，跑过的那一行链到那一次的对话，
+ * 「跳过」没有对话，只有一句说明。时间规则的中文描述不单独测 model，按 plan-2 的口径从页面上看（行里写的那句话
+ * 就是用户看到的那句）。
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { screen, within } from '@testing-library/react';
@@ -131,6 +133,55 @@ describe('自动化页', () => {
     expect(fetch.calls.some((call) => call.path.includes('schedule-others'))).toBe(false);
   });
 
+  it('最近一次跑成没跑成：跑完 · 时间，点得到那一次的对话', async () => {
+    api([
+      task({
+        title: '每日站会提醒',
+        lastRun: {
+          status: 'completed',
+          at: '2026-11-12T01:30:00+00:00',
+          conversationId: 'c_new',
+          title: '自动化',
+          note: null,
+        },
+      }),
+    ]);
+    renderWithApp(<AutomationsPage />, { route: '/automations' });
+
+    const row = await rowOf('每日站会提醒');
+    expect(row).toHaveTextContent('跑完 · 2026-11-12 09:30');
+    // 「每次新建对话」的任务每一轮都在新对话里：这一下要落到那一次新开的对话
+    expect(within(row).getByRole('link')).toHaveAttribute('href', '/chat/c_new');
+  });
+
+  it('跳过的那一次没有对话可去：写着原因，不做成链接', async () => {
+    api([
+      task({
+        title: '每日站会提醒',
+        lastRun: {
+          status: 'skipped',
+          at: '2026-11-12T01:30:00+00:00',
+          conversationId: null,
+          title: null,
+          note: '到点时上一轮还没结束，这一次跳过了',
+        },
+      }),
+    ]);
+    renderWithApp(<AutomationsPage />, { route: '/automations' });
+
+    const row = await rowOf('每日站会提醒');
+    expect(row).toHaveTextContent('跳过 · 2026-11-12 09:30');
+    expect(within(row).queryByRole('link')).not.toBeInTheDocument();
+    // 没有对话可去时，用 title 把「为什么跳过」挂上，鼠标停一下就看得到
+    expect(within(row).getByTitle('到点时上一轮还没结束，这一次跳过了')).toBeInTheDocument();
+  });
+
+  it('还没跑过的任务说「还没有跑过」，不装作失败', async () => {
+    api([task({ title: '每日站会提醒', lastRun: null })]);
+    renderWithApp(<AutomationsPage />, { route: '/automations' });
+    expect(await rowOf('每日站会提醒')).toHaveTextContent('还没有跑过');
+  });
+
   it('点单条能打开它的投递记录：哪一次、什么时间、投到哪个对话', async () => {
     const fetch = api([task({ id: 'schedule-1', title: '每日站会提醒' })], {
       [`GET ${B}/automations/schedule-1/history`]: jsonResponse({
@@ -167,6 +218,52 @@ describe('自动化页', () => {
     expect(within(sheet).getByText('第 1 次')).toBeInTheDocument();
     expect(within(sheet).getAllByText('2026-11-12 09:30')).toHaveLength(2);
     expect(within(sheet).getAllByText('站会准备')).toHaveLength(2);
+    expect(fetch.find('GET', `${B}/automations/schedule-1/history`)).toHaveLength(1);
+  });
+
+  it('投递记录里每一次都写着结果，跳过的那次排在最新、没有投递时间', async () => {
+    // 业务服务在看最近一页时把「跳过」补成一条合成记录（skipped + note，没有 deliveredAt）
+    const fetch = api([task({ id: 'schedule-1', title: '每日站会提醒' })], {
+      [`GET ${B}/automations/schedule-1/history`]: jsonResponse({
+        id: 'schedule-1',
+        records: [
+          {
+            scheduledAt: '2026-11-12T01:30:00+00:00',
+            deliveredAt: null,
+            messageId: 'skipped:2026-11-12T01:30:00Z',
+            targetSessionId: null,
+            targetTitle: null,
+            prompt: '提醒我准备站会材料',
+            status: 'skipped',
+            skipped: true,
+            note: '到点时上一轮还没结束，这一次跳过了',
+          },
+          {
+            scheduledAt: '2026-11-11T01:30:00+00:00',
+            deliveredAt: '2026-11-11T01:30:03+00:00',
+            messageId: 'm1',
+            targetSessionId: 'c_chat',
+            targetTitle: '站会准备',
+            prompt: '提醒我准备站会材料',
+            status: 'failed',
+            skipped: false,
+            note: null,
+          },
+        ],
+        nextBefore: null,
+        earlierRecordsUnavailable: false,
+      }),
+    });
+    renderWithApp(<AutomationsPage />, { route: '/automations' });
+    await userEvent.click(within(await rowOf('每日站会提醒')).getByRole('button', { name: '查看' }));
+
+    const sheet = await screen.findByRole('dialog');
+    const skipped = (await within(sheet).findByText('第 2 次')).closest('tr') as HTMLElement;
+    expect(within(skipped).getAllByText('跳过')).toHaveLength(1);
+    // 合成的那条没有投递时间：写 — 而不是留白
+    expect(within(skipped).getAllByText('—').length).toBeGreaterThan(0);
+    const ran = within(sheet).getByText('第 1 次').closest('tr') as HTMLElement;
+    expect(within(ran).getByText('失败')).toBeInTheDocument();
     expect(fetch.find('GET', `${B}/automations/schedule-1/history`)).toHaveLength(1);
   });
 });

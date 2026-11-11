@@ -9,6 +9,7 @@
  * 时间是本地时间（TZID 里的那个时区），不换 UTC：用户填的是「每天九点」，就该在九点跑。
  * 这层不碰网络也不碰状态，页面和表单都从这里取规则（plan-2 §4.3）。
  */
+import type { RunStatus } from '../../api/automations';
 
 /** ISO 星期，和 RRULE 的 BYDAY 同序（周一在前）。 */
 export const WEEKDAYS = ['MO', 'TU', 'WE', 'TH', 'FR', 'SA', 'SU'] as const;
@@ -274,6 +275,14 @@ export const STATUS_TEXT: Readonly<Record<AutomationStatus, string>> = {
   active: '运行中',
   paused: '已暂停',
   ended: '已结束',
+};
+
+/** 最近一次运行的结果说法：跑完/取消/失败来自那一轮汇总，「跳过」是到点时上一轮还没结束、这一次没跑。 */
+export const RUN_STATUS_TEXT: Readonly<Record<RunStatus, string>> = {
+  completed: '跑完',
+  cancelled: '取消',
+  failed: '失败',
+  skipped: '跳过',
 };
 
 export type AutomationOrigin = 'page' | 'chat';

@@ -212,6 +212,47 @@ def reminder_prompts(text: str) -> list[str]:
     return [text]
 
 
+def message_text(content: Any) -> str:
+    """一条消息的正文（只取文本块，不截断）：content 可能是字符串，也可能是块列表。"""
+    return content if isinstance(content, str) else _joined(content, ("text",))
+
+
+def reminder_schedules(text: str) -> tuple[dict[str, str], ...]:
+    """官方投递正文里每条任务的任务 id 与该跑的時刻：单条认 schedule_id_json + occurrence_at，
+    合并投递认 reminders_json 里每项的 schedule_id + occurrence_at。认不出来返回空（不是定时任务就不动汇总）。"""
+    for line in text.splitlines():
+        key, _, value = line.partition(": ")
+        try:
+            if key == "schedule_id_json":
+                schedule_id = json.loads(value)
+                if isinstance(schedule_id, str) and schedule_id:
+                    return ({"id": schedule_id, "occurrenceAt": _occurrence_at(text)},)
+            if key == "reminders_json":
+                items = json.loads(value)
+                if not isinstance(items, list):
+                    return ()
+                found = tuple({"id": item["schedule_id"], "occurrenceAt": _str(item.get("occurrence_at"))}
+                              for item in items
+                              if isinstance(item, dict) and _str(item.get("schedule_id")))
+                return found
+        except ValueError:
+            return ()
+    return ()
+
+
+def _occurrence_at(text: str) -> str:
+    """单条投递正文里的 occurrence_at 一行；没有就空串（任务 id 照样要认）。"""
+    for line in text.splitlines():
+        key, _, value = line.partition(": ")
+        if key == "occurrence_at":
+            return value.strip()
+    return ""
+
+
+def _str(value: Any) -> str:
+    return value if isinstance(value, str) else ""
+
+
 def _mentions(block: str) -> list[dict] | None:
     """@ 说明块的第一行；不是说明块返回 None。留类型、id、名字、所在知识库，扩展的另留类型标识与类型名
     （重新生成时前端照原样再发）。"""

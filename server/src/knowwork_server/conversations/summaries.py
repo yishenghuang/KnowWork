@@ -10,7 +10,7 @@
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
@@ -20,7 +20,7 @@ from sqlalchemy.dialects.postgresql import JSONPATH, insert
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from ..access.rls import set_workspace
-from .events_v1 import TRIGGER_TITLES, assistant_text, trigger_text, user_parts
+from .events_v1 import TRIGGER_TITLES, assistant_text, message_text, reminder_schedules, trigger_text, user_parts
 from .models import AnswerFeedback, Conversation, RunSummary
 
 log = logging.getLogger(__name__)
@@ -46,6 +46,8 @@ class TurnEnded:
     status: str
     user_id: str | None = None
     started_at: datetime | None = None  # 这一轮开始的时刻（模块按它取这一轮自己的记录）；没看到开始帧时为 None
+    # 这一轮是哪些定时任务投递进来的（任务 id 与它该跑的時刻）：自动化页按任务 id 反查最近一次跑成没跑成
+    schedule: tuple[dict[str, str], ...] = ()
 
 
 Contributor = Callable[[TurnEnded], Awaitable[Mapping[str, Any] | None]]
@@ -59,6 +61,7 @@ class _Turn:
     question: str | None = None  # 用户这一轮亲自发的第一条消息；后面的插话不算
     answer: str = ""             # 最后一条助手回答
     tools: tuple[str, ...] = ()
+    schedule: tuple[dict[str, str], ...] = ()  # 投递进这一轮的定时任务（见 TurnEnded.schedule）
 
 
 def _int(value: Any) -> int | None:
@@ -116,12 +119,16 @@ class RunSummaries:
             self._put(conversation_id, _Turn(turn=turn, started=started, question=question))
             if turn is not None:
                 self._spawn(self._started(workspace_id, conversation_id, turn, question or "", started))
-        elif event == "user/message" and current.question is None:
+        elif event == "user/message":
             source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
-            question = _question(source, payload.get("content"))
-            if question is not None:
-                self._put(conversation_id, replace(current, question=question))
-                if current.turn is not None:  # 进行中的那一行也看得到在问什么
+            content = payload.get("content")
+            # 定时任务投递进对话的那条消息正文里带任务 id：无论这一步认不认得出问题，都要把它记到这一轮上
+            refs = (reminder_schedules(message_text(content)) if source.get("kind") == "schedule" else ())
+            question = _question(source, content) if current.question is None else None
+            if question is not None or refs:
+                self._put(conversation_id, replace(current, question=current.question if question is None else question,
+                                                   schedule=refs or current.schedule))
+                if question is not None and current.turn is not None:  # 进行中的那一行也看得到在问什么
                     self._spawn(self._asked(workspace_id, conversation_id, current.turn, question,
                                             current.started or _time(data.get("time"))))
         elif event == "assistant/message":
@@ -141,7 +148,7 @@ class RunSummaries:
             kind = reason.get("kind") if isinstance(reason.get("kind"), str) else None
             ended = TurnEnded(workspace_id=workspace_id, conversation_id=conversation_id, turn=turn,
                               question=current.question or "", answer=current.answer, status=status_of(kind),
-                              started_at=current.started)
+                              started_at=current.started, schedule=current.schedule)
             self._spawn(self._ended(ended, kind, current.tools, _time(data.get("time"))))
 
     def _put(self, conversation_id: str, turn: _Turn) -> None:
@@ -190,6 +197,12 @@ class RunSummaries:
         try:
             user_id = await self._owner_of(ended.conversation_id)
             facts = await self._facts(replace(ended, user_id=user_id))
+            if ended.schedule:
+                # 自动化页按 facts.schedule.id 反查这条任务最近一次投递所在的那一轮（模块名固定 schedule）
+                facts = {**facts, "schedule": {
+                    "id": [item["id"] for item in ended.schedule],
+                    "occurrenceAt": next((item["occurrenceAt"] for item in ended.schedule if item["occurrenceAt"]),
+                                         None)}}
             if user_id is None:
                 return
             row = {"conversation_id": ended.conversation_id, "turn": ended.turn, "workspace_id": ended.workspace_id,
@@ -237,6 +250,13 @@ NOT_ANSWERED = ("partial", "unanswered")  # knowledge.answer_check 的 verdict �
 UNANSWERED_FACT = "$.* ? (@.unanswered == true)"
 
 
+def _recorded(facts: Any, module: str, key: str) -> list[str]:
+    """汇总里 facts[module][key] 记的值（字符串数组）；旧行没有这条事实，或者形状不对，就当没有。"""
+    group = facts.get(module) if isinstance(facts, dict) else None
+    values = group.get(key) if isinstance(group, dict) else None
+    return [value for value in values if isinstance(value, str)] if isinstance(values, list) else []
+
+
 @dataclass(frozen=True)
 class SummaryRow:
     summary: RunSummary
@@ -254,7 +274,7 @@ class SummaryQuery:
     async def page(self, workspace_id: str, *, since: datetime, until: datetime, before: datetime | None = None,
                    user_id: str | None = None, status: str | None = None, signal: str | None = None,
                    tool: str | None = None, base: str | None = None, fact: tuple[str, str, str] | None = None,
-                   limit: int = 50) -> tuple[SummaryRow, ...]:
+                   conversation_id: str | None = None, limit: int = 50) -> tuple[SummaryRow, ...]:
         """fact：(模块, 键, 值)，只要模块记的事实 facts[模块][键] 里有这个值的轮（例如问数记的用了哪几个数据源）。"""
         feedback = and_(AnswerFeedback.conversation_id == RunSummary.conversation_id,
                         AnswerFeedback.run_id == func.concat("run-", RunSummary.turn))
@@ -265,6 +285,8 @@ class SummaryQuery:
                             RunSummary.started_at < until))
         if before is not None:
             statement = statement.where(RunSummary.started_at < before)
+        if conversation_id is not None:
+            statement = statement.where(RunSummary.conversation_id == conversation_id)
         if user_id is not None:
             statement = statement.where(RunSummary.user_id == user_id)
         if status is not None:
@@ -289,3 +311,30 @@ class SummaryQuery:
         async with self._sessionmaker() as session:
             rows = (await session.execute(statement)).all()
         return tuple(SummaryRow(summary=summary, title=title or "", rating=rating) for summary, title, rating in rows)
+
+    async def latest_by_fact(self, workspace_id: str, *, module: str, key: str, values: Sequence[str],
+                             since: datetime, until: datetime) -> dict[str, SummaryRow]:
+        """按模块事实（facts[module][key] 是字符串数组）一次取回一批 id 各自最近的一次汇总（started_at 最新的那条）。
+        返回 {值: SummaryRow}，没有记录的 id 不在结果里。列表页用它避免逐条查。"""
+        wanted = [value for value in dict.fromkeys(values) if value]
+        if not wanted:
+            return {}
+        feedback = and_(AnswerFeedback.conversation_id == RunSummary.conversation_id,
+                        AnswerFeedback.run_id == func.concat("run-", RunSummary.turn))
+        statement = (select(RunSummary, Conversation.title, AnswerFeedback.rating)
+                     .join(Conversation, Conversation.id == RunSummary.conversation_id)
+                     .outerjoin(AnswerFeedback, feedback)
+                     .where(RunSummary.workspace_id == workspace_id, RunSummary.started_at >= since,
+                            RunSummary.started_at < until,
+                            or_(*(RunSummary.facts[module][key].contains([value]) for value in wanted)))
+                     .order_by(RunSummary.started_at.desc(), RunSummary.conversation_id).limit(2000))
+        async with self._sessionmaker() as session:
+            rows = (await session.execute(statement)).all()
+        latest: dict[str, SummaryRow] = {}
+        for summary, title, rating in rows:
+            row = SummaryRow(summary=summary, title=title or "", rating=rating)
+            for value in _recorded(summary.facts, module, key):
+                if value in latest or value not in wanted:
+                    continue
+                latest[value] = row  # 按 started_at 倒序来，每个值第一次遇到的就是最新的一条
+        return latest
