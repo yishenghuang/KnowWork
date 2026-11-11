@@ -22,6 +22,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from pydantic import BaseModel, ConfigDict, Field
 
+from ..audit import AuditFilter, AuditQuery
 from ..conversations.api import Actor, ActorDependency
 from ..conversations.service import Conversation, ConversationNotFound
 from ..conversations.summaries import SummaryQuery, SummaryRow
@@ -45,6 +46,10 @@ HOST_ERRORS = (KernelError, httpx.HTTPError, OSError)
 SKIPPED_NOTE = "到点时上一轮还没结束，这一次跳过了"
 # 最近一次运行只看近 30 天的汇总：更早的记录对「最近一次跑成没跑成」没有意义，也免得多读
 RUN_WINDOW = timedelta(days=30)
+
+AUDIT_PAUSE_ACTION = "automation.auto_paused"
+AUDIT_PAUSE_LIMIT = 200  # 与 AuditQuery.MAX_LIMIT 一致；一次批量读完，不为每条任务各查一次
+AUDIT_PAUSE_REASON = "连续 3 次运行失败，已自动暂停"
 
 
 def moment(value: Any) -> datetime | None:
@@ -181,7 +186,7 @@ def write_error(error: Exception, action: str) -> HTTPException:
 
 def build_router(kernel: HostKernel, current_actor: ActorDependency,
                  lookup: ConversationLookup | None = None, host_token: str | None = None,
-                 runs: SummaryQuery | None = None) -> APIRouter:
+                 runs: SummaryQuery | None = None, audit: AuditQuery | None = None) -> APIRouter:
     router = APIRouter(prefix="/api/workspaces/{workspace_id}/automations", tags=["automations"])
     Who = Annotated[Actor, Depends(current_actor)]
 
@@ -322,11 +327,40 @@ def build_router(kernel: HostKernel, current_actor: ActorDependency,
             return None
         return rows[0].summary.status if rows else None
 
+    async def auto_pauses(who: Actor, entries: list[dict]) -> dict[str, dict]:
+        """一次批量读「自动暂停」的原因：审计里按 id 留最新一条，只给这页里已暂停的任务。
+
+        AuditQuery.page 自己 set_workspace，按 occurred_at desc / id desc 返回，所以每个 id 的第一条就是最新的。
+        审计读不到或没登记查询对象都不能让列表读挂掉：返回空字典，前端退回普通「已暂停」文案。
+        """
+        if audit is None:
+            return {}
+        wanted = {entry["id"] for entry in entries if isinstance(entry, dict)
+                  and entry.get("status") == "paused" and isinstance(entry.get("id"), str) and entry["id"]}
+        if not wanted:
+            return {}
+        try:
+            page = await audit.page(who.workspace_id, AuditFilter(action=AUDIT_PAUSE_ACTION),
+                                    limit=AUDIT_PAUSE_LIMIT)
+        except Exception:
+            log.exception("reading auto-pause audit failed")
+            return {}
+        result: dict[str, dict] = {}
+        for item in page.items:
+            task_id = item.resource_id
+            if not isinstance(task_id, str) or task_id not in wanted or task_id in result:
+                continue
+            detail = item.detail if isinstance(item.detail, dict) else {}
+            reason = detail.get("reason")
+            result[task_id] = {"reason": reason if isinstance(reason, str) and reason else AUDIT_PAUSE_REASON,
+                               "at": iso(item.occurred_at)}
+        return result
+
     async def describe(entry: dict, who: Actor, run: SummaryRow | None = None,
-                       now: datetime | None = None) -> dict:
+                       now: datetime | None = None, auto_paused: dict | None = None) -> dict:
         moment_now = now or datetime.now(UTC)
         return {**entry, "origin": await origin_of(entry, who.workspace_id, who.user_id, lookup),
-                "lastRun": last_run(entry, run, moment_now)}
+                "lastRun": last_run(entry, run, moment_now), "autoPaused": auto_paused}
 
     @router.get("")
     async def list_automations(who: Who, limit: Annotated[int, Query(ge=1, le=500)] = 100,
@@ -339,7 +373,9 @@ def build_router(kernel: HostKernel, current_actor: ActorDependency,
         entries = [entry for entry in page.get("items", []) if isinstance(entry, dict)]
         now = datetime.now(UTC)
         latest = await latest_runs(who, entries, now)
-        items = [await describe(entry, who, latest.get(str(entry.get("id"))), now) for entry in entries]
+        pauses = await auto_pauses(who, entries)
+        items = [await describe(entry, who, latest.get(str(entry.get("id"))), now,
+                                pauses.get(str(entry.get("id")))) for entry in entries]
         return {"items": items, "total": page.get("total", len(items)), "limit": page.get("limit", limit),
                 "offset": page.get("offset", offset)}
 
@@ -352,7 +388,8 @@ def build_router(kernel: HostKernel, current_actor: ActorDependency,
             raise upstream_error(error, "view schedule") from error
         now = datetime.now(UTC)
         latest = await latest_runs(who, [entry], now)
-        return await describe(entry, who, latest.get(schedule_id), now)
+        pauses = await auto_pauses(who, [entry])
+        return await describe(entry, who, latest.get(schedule_id), now, pauses.get(schedule_id))
 
     @router.get("/{schedule_id}/history")
     async def automation_history(schedule_id: ScheduleId, who: Who,

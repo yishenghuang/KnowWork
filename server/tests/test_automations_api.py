@@ -5,6 +5,7 @@
 - 每条任务补一个 origin：页面上建的（page）还是对话里设的提醒（chat），判定在业务服务一处做完。"""
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import httpx
@@ -53,6 +54,7 @@ class FakeHost:
         self.view_effect: BaseException | None = None
         self.history_effect: BaseException | None = None
         self.items: list[dict] = [entry()]
+        self.view_items: dict[str, dict] = {}
 
     async def list_schedules(self, *, owner, limit=100, offset=0, active=None):
         self.listed.append({"owner": owner, "limit": limit, "offset": offset, "active": active})
@@ -64,7 +66,7 @@ class FakeHost:
         self.viewed.append((schedule_id, owner))
         if self.view_effect is not None:
             raise self.view_effect
-        return entry({"id": schedule_id})
+        return self.view_items.get(schedule_id) or entry({"id": schedule_id})
 
     async def schedule_history(self, schedule_id, *, owner, limit=20, before=None):
         self.histories.append((schedule_id, owner, limit, before))
@@ -110,6 +112,7 @@ async def world(app_db):
     http = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://internal")
     state = World(host=host, chat=chat, page=page)
     state.http = http
+    state.sessionmaker = sessionmaker
     yield state
     await http.aclose()
     await engine.dispose()
@@ -202,3 +205,82 @@ async def test_missing_or_someone_elses_task_is_404(world):
 async def test_task_id_shape_is_checked(world):
     assert (await world.get(f"{BASE}/bad id")).status_code == 422, "不合法 id 不往宿主发"
     assert world.host.viewed == []
+
+# --- 连续失败自动暂停：读侧从审计里取原因，只给已暂停的任务 ---
+
+
+class FakeAuditQuery:
+    """审计查询替身：记录调用参数，按脚本回放 AuditPage 或抛错，不碰真库。"""
+
+    def __init__(self, items=(), error=None):
+        self.items = tuple(items)
+        self.error = error
+        self.calls: list[tuple] = []
+        self.workspace = None
+
+    async def page(self, workspace_id, flt, *, limit=50, cursor=None):
+        self.calls.append((workspace_id, flt, limit))
+        if self.error is not None:
+            raise self.error
+        return SimpleNamespace(items=self.items)
+
+
+def audit_row(task_id, reason, at, *, detail=None):
+    """审计行的替身：读侧只用 resource_id / detail / occurred_at。"""
+    return SimpleNamespace(resource_id=task_id,
+                           detail={"reason": reason} if detail is None else detail,
+                           occurred_at=at)
+
+
+def with_audit(state, audit):
+    """用带 audit 的 router 重建 app，并重建挂在它上面的 AsyncClient。"""
+    app = FastAPI()
+    app.include_router(build_router(state.host, token_actor(TOKEN, user_id="u1", workspace_id=WORKSPACE),
+                                    _lookup(state.sessionmaker), audit=audit))
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://internal")
+
+
+async def test_auto_pause_reason_comes_from_audit(world):
+    """已暂停任务带出最近一条自动暂停审计的原因与时间；active 任务与别人的任务都不带。"""
+    world.host.items = [entry({"id": "paused-1", "status": "paused"}),
+                        entry({"id": "active-1", "status": "active"}),
+                        entry({"id": "paused-2", "status": "paused"})]
+    at = datetime(2026, 11, 11, 10, 0, tzinfo=UTC)
+    audit = FakeAuditQuery([
+        audit_row("paused-1", "连不上模型（新）", at),
+        audit_row("paused-1", "连不上模型（旧）", datetime(2026, 11, 10, 10, 0, tzinfo=UTC)),
+        audit_row("paused-2", "", at, detail={}),
+        audit_row("active-1", "不该出现", at),
+        audit_row("other-task", "别的任务", at),
+    ])
+    async with with_audit(world, audit) as http:
+        body = (await http.get(BASE, headers={"Authorization": f"Bearer {TOKEN}"})).json()
+    assert {item["id"]: item["autoPaused"] for item in body["items"]} == {
+        "paused-1": {"reason": "连不上模型（新）", "at": "2026-11-11T10:00:00Z"},
+        "active-1": None,
+        "paused-2": {"reason": "连续 3 次运行失败，已自动暂停", "at": "2026-11-11T10:00:00Z"},
+    }
+    assert len(audit.calls) == 1
+    assert audit.calls[0][0] == WORKSPACE
+    assert audit.calls[0][1].action == "automation.auto_paused"
+    assert audit.calls[0][2] == 200
+
+
+async def test_auto_pause_reason_on_single_task(world):
+    world.host.view_items["schedule-1"] = entry({"id": "schedule-1", "status": "paused"})
+    at = datetime(2026, 11, 11, 10, 0, tzinfo=UTC)
+    audit = FakeAuditQuery([audit_row("schedule-1", "连续失败", at)])
+    async with with_audit(world, audit) as http:
+        body = (await http.get(f"{BASE}/schedule-1", headers={"Authorization": f"Bearer {TOKEN}"})).json()
+    assert body["autoPaused"] == {"reason": "连续失败", "at": "2026-11-11T10:00:00Z"}
+
+
+async def test_no_audit_query_or_failed_read_never_breaks_the_list(world):
+    """没登记 audit、或审计读失败：列表照常返回、autoPaused 为 null，不能把读列表带挂。"""
+    assert (await world.get(BASE)).json()["items"][0]["autoPaused"] is None
+    world.host.items = [entry({"id": "paused-1", "status": "paused"})]
+    audit = FakeAuditQuery(error=OSError("审计库连不上"))
+    async with with_audit(world, audit) as http:
+        response = await http.get(BASE, headers={"Authorization": f"Bearer {TOKEN}"})
+    assert response.status_code == 200
+    assert response.json()["items"][0]["autoPaused"] is None

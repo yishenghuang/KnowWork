@@ -303,6 +303,41 @@ describe('自动化页', () => {
     expect(await screen.findByText('已恢复')).toBeInTheDocument();
   });
 
+  it('自动暂停的任务显著标「已自动暂停」与原因，点「恢复」发 POST .../resume', async () => {
+    const reason = '连续 3 次运行失败，已自动暂停';
+    const fetch = api(
+      [task({ status: 'paused', autoPaused: { reason, at: '2026-11-11T10:00:00+00:00' } })],
+      actions(),
+    );
+    renderWithApp(<AutomationsPage />, { route: '/automations' });
+    const row = await rowOf('每日站会提醒');
+    expect(within(row).getByText('已自动暂停')).toBeInTheDocument();
+    expect(within(row).getByText(reason)).toBeInTheDocument();
+    expect(within(row).queryByText('已暂停')).not.toBeInTheDocument();
+    await userEvent.click(within(row).getByRole('button', { name: '恢复' }));
+
+    expect(fetch.find('POST', `${B}/automations/schedule-1/resume`)).toHaveLength(1);
+    expect(await screen.findByText('已恢复')).toBeInTheDocument();
+  });
+
+  it('普通暂停（没有 autoPaused）只显示「已暂停」，不误报自动暂停', async () => {
+    api([task({ status: 'paused', autoPaused: null })], actions());
+    renderWithApp(<AutomationsPage />, { route: '/automations' });
+    const row = await rowOf('每日站会提醒');
+    expect(within(row).getByText('已暂停')).toBeInTheDocument();
+    expect(within(row).queryByText('已自动暂停')).not.toBeInTheDocument();
+  });
+
+  it('运行中的任务即使后端给了 autoPaused 也不显示自动暂停', async () => {
+    const reason = '连续 3 次运行失败，已自动暂停';
+    api([task({ status: 'active', autoPaused: { reason, at: null } })], actions());
+    renderWithApp(<AutomationsPage />, { route: '/automations' });
+    const row = await rowOf('每日站会提醒');
+    expect(within(row).getByText('运行中')).toBeInTheDocument();
+    expect(within(row).queryByText('已自动暂停')).not.toBeInTheDocument();
+    expect(within(row).queryByText(reason)).not.toBeInTheDocument();
+  });
+
   it('正在执行或排队的任务：「立即运行」不可点，并说明原因', async () => {
     api([task({ executionActive: true })], actions());
     renderWithApp(<AutomationsPage />, { route: '/automations' });

@@ -48,6 +48,9 @@ export interface DeliveryRecord {
   readonly note: string | null;
 }
 
+/** 连续 3 次运行失败被自动暂停的原因与时间；读侧只对已暂停的任务给，老服务端没有这个字段。 */
+export type AutoPaused = { reason: string; at: string | null };
+
 export interface Automation {
   readonly id: string;
   readonly title: string;
@@ -63,6 +66,8 @@ export interface Automation {
   readonly lastDelivery: DeliveryRecord | null;
   /** 最近一次跑成没跑成；还没跑过、或读不到时为 null。 */
   readonly lastRun: LastRun | null;
+  /** 被连续失败自动暂停时带原因；普通暂停或读不到时为 null。 */
+  readonly autoPaused: AutoPaused | null;
   readonly createdAt: string | null;
   readonly updatedAt: string | null;
   /** 宿主说这一轮正在跑或排队（runSchedule 后立即为 true）：「立即运行」按钮这时不能点。 */
@@ -147,6 +152,15 @@ function parseLastRun(value: unknown): LastRun | null {
   };
 }
 
+/** 自动暂停原因：认得出 reason 字符串才收，时间缺了就是 null；老服务端没这字段整条当没有。 */
+function parseAutoPaused(value: unknown): AutoPaused | null {
+  if (!isRecord(value)) return null;
+  const reason = str(value.reason);
+  if (reason === undefined) return null;
+  const at = str(value.at);
+  return { reason, at: at ?? null };
+}
+
 export function parseAutomation(value: unknown): Automation | undefined {
   if (!isRecord(value)) return undefined;
   const id = text(value.id);
@@ -164,6 +178,7 @@ export function parseAutomation(value: unknown): Automation | undefined {
     targetSessionId: target ? (text(target.sessionId) ?? null) : null,
     lastDelivery: parseDelivery(value.lastDelivery) ?? null,
     lastRun: parseLastRun(value.lastRun),
+    autoPaused: parseAutoPaused(value.autoPaused),
     createdAt: text(value.createdAt) ?? null,
     updatedAt: text(value.updatedAt) ?? null,
     executionActive: value.executionActive === true,

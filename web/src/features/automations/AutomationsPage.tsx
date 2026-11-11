@@ -45,7 +45,24 @@ const COLUMNS: readonly Column<Automation>[] = [
     render: (task) => <span className="kw-num">{formatDateTime(task.scheduledAt)}</span>,
   },
   { key: 'lastRun', title: '最近一次', width: 210, render: (task) => <LastRun run={task.lastRun} /> },
-  { key: 'status', title: '状态', width: 80, render: (task) => STATUS_TEXT[task.status] },
+  {
+    key: 'status',
+    title: '状态',
+    width: 150,
+    render: (task) => {
+      // 读侧只对已暂停的任务给 autoPaused；前端也守住状态，免得运行中的任务被误标成自动暂停。
+      if (!task.autoPaused || task.status !== 'paused') return STATUS_TEXT[task.status];
+      // 连续失败被自动停下：把「停了」和「为什么停」都显著标出来；一键恢复由下面「操作」列原有的「恢复」按钮负责。
+      return (
+        <span style={{ color: '#cf1322', fontWeight: 600 }}>
+          已自动暂停
+          <span style={{ display: 'block', marginTop: 2, fontWeight: 400, fontSize: 12 }}>
+            {task.autoPaused.reason}
+          </span>
+        </span>
+      );
+    },
+  },
 ];
 
 /** 最近一次跑成没跑成：跑完/取消/失败 + 那一刻，链到那一次的对话；跳过的没有对话，只有一句说明。 */
