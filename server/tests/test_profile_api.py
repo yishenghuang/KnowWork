@@ -29,7 +29,7 @@ class Profiles:
     def __init__(self):
         self.selections, self.fail, self.bindings = [], False, {}
 
-    async def compile(self, conversation, selection=None):
+    async def compile(self, conversation, selection=None, readonly=False):
         if self.fail:
             raise ProfileUnavailable()
         self.selections.append(selection)

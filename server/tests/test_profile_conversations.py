@@ -223,7 +223,7 @@ async def test_creating_with_the_first_selection_does_not_reopen(db):
 async def test_profile_unavailable_blocks_create_without_orphan(db):
     env = Env(db)
 
-    async def broken(conversation, selection=None):
+    async def broken(conversation, selection=None, readonly=False):
         raise ProfileUnavailable()
 
     env.profiles.compile = broken
