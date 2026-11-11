@@ -13,7 +13,9 @@ import { startMockLlmServer } from '@deepseek-ai/dsh-llm-mock-server'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..')
 const PROFILE_TEMPLATE = join(ROOT, 'profile')
-const DSH_BIN = join(ROOT, 'node_modules', '.bin', 'dsh')
+// node_modules/.bin/dsh 在 POSIX 上是 shell 垫片，Windows 上根本没有（只有 dsh.cmd）；
+// 两种平台都直接用 node 跑同一个入口，免得测试只能在 Linux 上起宿主。
+const DSH_BIN = join(ROOT, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
 const TEST_OVERLAY = join(ROOT, 'tests', 'overlays', 'test-tools.yml')
 
 /** 每个测试一个独立的 DSH_HOME，避免会话文件互相影响。 */
@@ -49,7 +51,7 @@ export async function startHost(mock, env = {}, options = {}) {
   const home = options.home ?? freshDshHome()
   // options.patches：再叠加几份测试配置（例如工作流试点），按顺序跟在测试工具配置后面
   const patches = (options.patches ?? []).flatMap(file => ['--patch', file])
-  const child = spawn(DSH_BIN, ['--profile', 'knowwork-host', '--patch', TEST_OVERLAY, ...patches], {
+  const child = spawn(process.execPath, [DSH_BIN, '--profile', 'knowwork-host', '--patch', TEST_OVERLAY, ...patches], {
     cwd: ROOT,
     env: {
       ...process.env,

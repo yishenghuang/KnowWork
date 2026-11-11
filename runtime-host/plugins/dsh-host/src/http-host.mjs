@@ -352,17 +352,28 @@ export function apply(ctx, config) {
     for (const frame of framesAfter(state, after)) line(frame)
 
     let ended = false
+    // 一帧可能比 socket 的写缓冲还大：res.write 返回 false 只表示这一帧还在排队，不代表订阅方已经断开。
+    // 拿它当断开处理会在「请求头」这类大帧之后把事件流整个掐掉，所以只在连接真的没了时才结束。
+    const alive = () => !res.writableEnded && !res.destroyed
     const subscriber = {
-      write: frame => !ended && line(frame),
+      write: frame => {
+        if (ended) return true
+        if (!alive()) {
+          subscriber.end()
+          return false
+        }
+        line(frame)
+        return true
+      },
       end: () => {
         if (ended) return
         ended = true
         clearInterval(heartbeat)
         state.subscribers.delete(subscriber)
-        res.end()
+        if (alive()) res.end()
       },
     }
-    const heartbeat = setInterval(() => { if (!res.write('\n')) subscriber.end() }, HEARTBEAT_MS)
+    const heartbeat = setInterval(() => { if (alive()) res.write('\n'); else subscriber.end() }, HEARTBEAT_MS)
     state.subscribers.add(subscriber)
     req.on('close', () => subscriber.end())
   }
