@@ -275,3 +275,43 @@ export async function runAutomation(id: string): Promise<void> {
 export async function deleteAutomation(id: string): Promise<void> {
   await request<unknown>(base(`/${seg(id)}`), { method: 'DELETE' });
 }
+
+/** 管理端看到的一条任务：在「我的任务」那些字段之外，多一个创建者（宿主属主账本里的 userId + 资料里的姓名）。 */
+export interface AdminAutomation extends Automation {
+  /** 创建者的显示名；账号注销或资料服务读不到时为 null，界面上退回用户 id。 */
+  readonly creatorName: string | null;
+  /** 创建者的用户 id；按创建者筛选用它，同名的人也不会被并成一条。 */
+  readonly creatorId: string | null;
+}
+
+function parseAdminAutomation(value: unknown): AdminAutomation | undefined {
+  const task = parseAutomation(value);
+  if (!task) return undefined;
+  if (!isRecord(value)) return { ...task, creatorName: null, creatorId: null };
+  // 属主是宿主给全量读补上的；老宿主没有这字段就当不知道是谁建的，别把整条任务丢掉
+  const owner = isRecord(value.owner) ? value.owner : undefined;
+  return {
+    ...task,
+    creatorName: text(value.creatorName) ?? null,
+    creatorId: owner ? (text(owner.userId) ?? null) : null,
+  };
+}
+
+export interface AdminAutomationPage {
+  readonly items: readonly AdminAutomation[];
+  readonly total: number;
+}
+
+/** 管理端：本空间全部定时任务（含已暂停与已结束的）。只有空间所有者/管理员拿得到，普通用户是 403。 */
+export async function listAdminAutomations(): Promise<AdminAutomationPage> {
+  const body = await request<unknown>(base('/admin'));
+  if (!isRecord(body)) return { items: [], total: 0 };
+  const items = listOf(body.items, parseAdminAutomation);
+  return { items, total: typeof body.total === 'number' ? body.total : items.length };
+}
+
+/** 管理端停用一条任务：到点不再触发。宿主只接受「停用」这一种改动，改内容仍由创建者自己做。 */
+export async function disableAdminAutomation(id: string): Promise<void> {
+  await request<unknown>(base(`/admin/${seg(id)}/disable`), { method: 'POST' });
+}
+

@@ -5,6 +5,7 @@ import {
   Bolt,
   BookOpen,
   Chats,
+  Clock,
   EnterLogin,
   Groups,
   History,
@@ -56,6 +57,7 @@ export const ADMIN_NAV: readonly NavGroup[] = [
       { to: '/admin/runs', label: '运行记录', icon: <History /> },
       { to: '/admin/usage', label: '用量', icon: <BarChart /> },
       { to: '/admin/audit', label: '审计', icon: <Report /> },
+      { to: '/admin/automations', label: '自动化审计', icon: <Clock /> },
     ],
   },
 ];

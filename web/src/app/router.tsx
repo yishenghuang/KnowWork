@@ -33,6 +33,7 @@ const ToolsPage = lazy(() => import('../features/admin/tools/ToolsPage'));
 const SystemPage = lazy(() => import('../features/admin/system/SystemPage'));
 const LoginMethodsPage = lazy(() => import('../features/admin/login/LoginMethodsPage'));
 const JobsPage = lazy(() => import('../features/admin/jobs/JobsPage'));
+const AutomationAuditPage = lazy(() => import('../features/admin/automations/AutomationsPage'));
 
 const page = (node: ReactNode) => (
   <Suspense fallback={<Skeleton rows={6} className="kw-page-state" />}>{node}</Suspense>
@@ -53,6 +54,7 @@ const adminRoutes = (): RouteObject[] => [
   { path: 'channels', element: page(<ChannelsPage />) },
   { path: 'runs', element: page(<RunsPage />) },
   { path: 'audit', element: page(<AuditPage />) },
+  { path: 'automations', element: page(<AutomationAuditPage />) },
   { path: 'login-methods', element: page(<LoginMethodsPage />) },
   { path: 'system', element: page(<SystemPage />) },
   { path: 'jobs', element: page(<JobsPage />) },

@@ -76,6 +76,35 @@ def skipped_now(entry: dict, now: datetime) -> bool:
     return due is not None and due <= now
 
 
+def last_run(entry: dict, row: SummaryRow | None, now: datetime) -> dict | None:
+    """这条任务最近一次跑成没跑成：跑完/取消/失败取那一轮汇总的状态，跳过按上面那三个条件推。
+    一轮汇总都没有（还没跑过，或 30 天内没有）时为空。
+
+    管理端审计页与「我的定时任务」都读这一段：两边对「最近一次」的说法必须一致。
+    """
+    if skipped_now(entry, now):
+        return {"status": "skipped", "at": entry.get("scheduledAt"), "conversationId": None, "title": None,
+                "note": SKIPPED_NOTE}
+    if row is None:
+        return None
+    return {"status": row.summary.status, "at": iso(row.summary.started_at),
+            "conversationId": row.summary.conversation_id, "title": row.title or None, "note": None}
+
+
+async def latest_runs(runs: SummaryQuery | None, workspace_id: str, entries: list[dict],
+                      now: datetime) -> dict[str, SummaryRow]:
+    """一次把这批任务各自最近的一轮汇总取回来（列表页不能一条一条查）。"""
+    if runs is None:
+        return {}
+    wanted = [entry["id"] for entry in entries if isinstance(entry.get("id"), str) and entry["id"]]
+    try:
+        return await runs.latest_by_fact(workspace_id, module="schedule", key="id", values=wanted,
+                                         since=now - RUN_WINDOW, until=now)
+    except Exception:
+        log.exception("reading the latest runs failed")
+        return {}
+
+
 def owner_of(who: Actor) -> SessionOwner:
     return SessionOwner(workspace_id=who.workspace_id, user_id=who.user_id)
 
@@ -263,29 +292,6 @@ def build_router(kernel: HostKernel, current_actor: ActorDependency,
         if int(workspace.get("total", 0)) >= limits.MAX_PER_WORKSPACE:
             raise rejected(PER_WORKSPACE_QUOTA)
 
-    def last_run(entry: dict, row: SummaryRow | None, now: datetime) -> dict | None:
-        """这条任务最近一次跑成没跑成：跑完/取消/失败取那一轮汇总的状态，跳过按上面那三个条件推。
-        一轮汇总都没有（还没跑过，或 30 天内没有）时为空。"""
-        if skipped_now(entry, now):
-            return {"status": "skipped", "at": entry.get("scheduledAt"), "conversationId": None, "title": None,
-                    "note": SKIPPED_NOTE}
-        if row is None:
-            return None
-        return {"status": row.summary.status, "at": iso(row.summary.started_at),
-                "conversationId": row.summary.conversation_id, "title": row.title or None, "note": None}
-
-    async def latest_runs(who: Actor, entries: list[dict], now: datetime) -> dict[str, SummaryRow]:
-        """一次把这批任务各自最近的一轮汇总取回来（列表页不能一条一条查）。"""
-        if runs is None:
-            return {}
-        wanted = [entry["id"] for entry in entries if isinstance(entry.get("id"), str) and entry["id"]]
-        try:
-            return await runs.latest_by_fact(who.workspace_id, module="schedule", key="id", values=wanted,
-                                             since=now - RUN_WINDOW, until=now)
-        except Exception:
-            log.exception("reading the latest runs failed")
-            return {}
-
     async def current_entry(schedule_id: str, who: Actor) -> dict | None:
         """当前这条任务（历史里要不要补一条「跳过」、时间窗算到哪，都要看它）。读不到就当没有，不影响记录本身。"""
         try:
@@ -372,7 +378,7 @@ def build_router(kernel: HostKernel, current_actor: ActorDependency,
             raise upstream_error(error, "list schedules") from error
         entries = [entry for entry in page.get("items", []) if isinstance(entry, dict)]
         now = datetime.now(UTC)
-        latest = await latest_runs(who, entries, now)
+        latest = await latest_runs(runs, who.workspace_id, entries, now)
         pauses = await auto_pauses(who, entries)
         items = [await describe(entry, who, latest.get(str(entry.get("id"))), now,
                                 pauses.get(str(entry.get("id")))) for entry in entries]
@@ -387,7 +393,7 @@ def build_router(kernel: HostKernel, current_actor: ActorDependency,
         except HOST_ERRORS as error:
             raise upstream_error(error, "view schedule") from error
         now = datetime.now(UTC)
-        latest = await latest_runs(who, [entry], now)
+        latest = await latest_runs(runs, who.workspace_id, [entry], now)
         pauses = await auto_pauses(who, [entry])
         return await describe(entry, who, latest.get(schedule_id), now, pauses.get(schedule_id))
 

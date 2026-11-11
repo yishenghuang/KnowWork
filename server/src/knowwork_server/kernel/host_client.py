@@ -47,6 +47,7 @@ STREAM_TIMEOUT = httpx.Timeout(30.0, read=15.0)
 
 # 只按空间计数时带这一个头：宿主那边的计数路由不接受用户头
 OWNER_WORKSPACE_HEADER = "x-knowwork-owner-workspace"
+ADMIN_WORKSPACE_HEADER = "x-knowwork-admin-workspace"  # 管理端停用任务时声明停的是哪个空间的任务
 
 
 def _raise_for(response: httpx.Response) -> None:
@@ -254,6 +255,20 @@ class HostKernel:
         """改一条定时任务：body 是 {action, patch?, expectedUpdatedAt?}。"""
         path = f"/v1/schedule/{_segment(schedule_id)}"
         response = await self._client.patch(path, json=body, headers=_owner_headers(owner))
+        _raise_for(response)
+        return response.json()
+
+    async def disable_schedule_for_admin(self, schedule_id: str, *, workspace_id: str) -> dict:
+        """管理端停用本空间的一条定时任务。
+
+        不带调用者身份（管理端不是这条任务的属主），改带 x-knowwork-admin-workspace 说明停的是哪个空间的任务：
+        宿主据此核对任务属主，不属于这个空间的回 schedule_not_found，也不会替谁放行。只发 {active:false}——
+        宿主的这个入口除了停用一概不接。
+        """
+        path = f"/v1/schedule/{_segment(schedule_id)}"
+        headers = {ADMIN_WORKSPACE_HEADER: workspace_id}
+        response = await self._client.patch(path, json={"action": "update", "patch": {"active": False}},
+                                            headers=headers)
         _raise_for(response)
         return response.json()
 

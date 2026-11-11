@@ -28,6 +28,7 @@ from .attachments.api import build_router as attachments_router
 from .attachments.turns import TurnAttachments
 from .audit import AUDIT_SCOPE, AuditModule, build_audit
 from .audit import build_router as audit_router
+from .automations.admin import build_router as automations_admin_router
 from .automations.api import build_router as automations_router
 from .automations.internal import build_automation_conversation_router
 from .automations.supervisor import ScheduleSupervisor
@@ -588,6 +589,11 @@ def create_public_app(runtime: Runtime) -> FastAPI:
     actor = conversation_actor(identity, access)
     app.include_router(mention_router(runtime.mention_sources, actor))  # 排在会话路由前，见 mention_api
     app.include_router(conversation_router(runtime.service, actor, runtime.feedback))
+    # 管理端审计本空间的自动化任务（看全量、停用任意一条）。必须排在「我的定时任务」前面：
+    # 那条路由的 /{schedule_id} 会把 /automations/admin 当成一个任务 id 收走（见 automations/admin.py）
+    app.include_router(automations_admin_router(runtime.kernel, access, scoped_principal(identity, WORKSPACE_SCOPE),
+                                                lookup=runtime.service, runs=runtime.summary_query,
+                                                profiles=identity.users.get_many))
     # 自动化页读我的定时任务：任务在宿主里，这里只转达并按执行位置判定视图（见 automations/api.py）
     app.include_router(automations_router(runtime.kernel, actor, runtime.service, runs=runtime.summary_query,
                                          audit=runtime.audit.query))

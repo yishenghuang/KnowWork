@@ -47,6 +47,8 @@ const SCHEDULE_ID_PATTERN = /^[A-Za-z0-9_.:-]{1,128}$/
 // 业务服务在请求头里声明这次是谁在问（宿主用共享令牌认证，二者都是内网可信面）
 const OWNER_WORKSPACE_HEADER = 'x-knowwork-owner-workspace'
 const OWNER_USER_HEADER = 'x-knowwork-owner-user'
+// 管理端停用任务时声明「停的是哪个空间的任务」：管理员只能停本空间的，替别人建与改内容都不在管理端
+const ADMIN_WORKSPACE_HEADER = 'x-knowwork-admin-workspace'
 const CREDENTIAL_ACTIONS = new Set(['tool-credential', 'skill-credential'])
 // 官方远程方法（remoteCreate / remoteEdit / remoteList …）把输入校验错误包成这个 code 的 RemoteError，
 // 原来的 ScheduleInputError.code 在 details.code 里
@@ -569,16 +571,25 @@ export function apply(ctx, config) {
     }
   }
 
-  function listSchedules(owner, url) {
+  /**
+   * 全量读（没有调用者身份，也就是管理端在审计整个宿主）时每条任务要带上归属：业务服务只认空间，
+   * 拿不到归属就没法只列本空间的任务。归属问属主账本，取不到就记 null（账本里没有的任务不编造属主）。
+   * 带身份头的个人列表不加这个字段：适配层已经只回他自己的，多一个 owner 反而把内部账本泄漏给页面。
+   */
+  async function listSchedules(owner, url) {
     const query = url.searchParams
     const limit = query.get('limit')
     const offset = query.get('offset')
     const active = query.get('active')
-    return asCaller(owner, () => scheduleService().remoteList({
+    const page = await asCaller(owner, () => scheduleService().remoteList({
       ...(limit === null ? {} : { limit: Number(limit) }),
       ...(offset === null ? {} : { offset: Number(offset) }),
       ...(active === null ? {} : { active: active === 'true' }),
     }))
+    if (owner !== undefined) return page
+    const owners = ctx.get('knowworkOwners')
+    if (owners === undefined) throw new HttpError(503, 'schedule_unavailable', '宿主没有挂载属主账本')
+    return { ...page, items: page.items.map(entry => ({ ...entry, owner: owners.ownerOf('schedule', entry.id) ?? null })) }
   }
 
   function viewSchedule(owner, id) {
@@ -683,6 +694,28 @@ export function apply(ctx, config) {
     return asCaller(owner, () => scheduleService().run({ id })).then(settled)
   }
 
+  /**
+   * 管理端停用：业务服务确认过调用者是空间管理员之后，带着 x-knowwork-admin-workspace 来停一条任务。
+   * 这里不按调用者跑（管理端没有「某个人」的身份），所以适配层不会替我们校验归属——空间必须在这里自己判：
+   * 任务属主不是这个空间的，一律当「没有这个任务」，不能凭管理员身份停到别人空间去。
+   * 管理端只做停用一件事：patch 必须恰好是 {active:false}，其余字段（标题、内容、目标、重新启用）都不接受。
+   */
+  async function disableScheduleForAdmin(headers, id, body) {
+    const workspaceId = headers[ADMIN_WORKSPACE_HEADER]
+    if (typeof workspaceId !== 'string' || workspaceId.length === 0 || workspaceId.length > 128) {
+      throw new HttpError(400, 'invalid_request', `${ADMIN_WORKSPACE_HEADER} 必须是 1 到 128 个字符的字符串`)
+    }
+    const patch = body?.patch
+    const keys = patch === undefined || patch === null || typeof patch !== 'object' || Array.isArray(patch) ? [] : Object.keys(patch)
+    if (patch?.active !== false || keys.length !== 1) {
+      throw new HttpError(400, 'invalid_request', '管理端只能停用任务（请求体必须是 {"patch":{"active":false}}）')
+    }
+    const owners = ctx.get('knowworkOwners')
+    if (owners === undefined) throw new HttpError(503, 'schedule_unavailable', '宿主没有挂载属主账本')
+    if (owners.ownerOf('schedule', id)?.workspaceId !== workspaceId) throw new HttpError(404, 'schedule_not_found', '没有这个定时任务')
+    return scheduleService().remoteEdit({ id, action: 'update', patch: { active: false } }).then(settled)
+  }
+
   async function route(req, res) {
     const url = new URL(req.url ?? '/', 'http://host')
     const path = url.pathname
@@ -708,6 +741,17 @@ export function apply(ctx, config) {
       if (action === undefined) return send(res, 200, await viewSchedule(owner, scheduleId))
       if (action === 'history' && extra === undefined) return send(res, 200, await scheduleHistory(owner, scheduleId, url))
       throw new HttpError(404, 'not_found', '路径不存在')
+    }
+
+    // 管理端停用：只认一个「停哪个空间的任务」的头，不带也不看调用者身份头（管理端代表空间，不代表某个人）。
+    // 必须排在写侧 writerOf 之前：管理端请求没有调用者身份，走普通写侧会被当成缺身份 400。
+    if (req.method === 'PATCH' && req.headers[ADMIN_WORKSPACE_HEADER] !== undefined
+      && path.startsWith('/v1/schedule/')) {
+      const [rawId, action, extra] = path.slice('/v1/schedule/'.length).split('/')
+      if (rawId === undefined || rawId === '' || action !== undefined || extra !== undefined) {
+        throw new HttpError(404, 'not_found', '路径不存在')
+      }
+      return send(res, 200, await disableScheduleForAdmin(req.headers, scheduleIdOf(rawId), await readJson(req)))
     }
 
     // 定时任务写侧：POST /v1/schedule、PATCH /v1/schedule/{id}、DELETE /v1/schedule/{id}、POST /v1/schedule/{id}/run
