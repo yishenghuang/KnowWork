@@ -14,10 +14,11 @@
  * - 模型传了 -1（不限时）的调用到上限按超时关闭（question/closed，reason=timeout）：官方 `ask()` 只会返回回答
  *   或报错，没有 pending 可走；
  * - 回合取消、会话释放 → question/closed（reason=cancelled）；
- * - 宿主正常关闭（SIGTERM）→ question/closed（reason=interrupted）。这是上游行为：DSH 关闭时整棵插件树并发释放，
- *   官方问答服务自己把前台等待以 ASK_ABORTED 中止，工具结果记成「已中止」，恢复会话后问题不能再答（实测，
- *   插件之间的释放先后不可控，宿主侧绕不开）。界面据此提示用户直接在输入框回复。宿主崩溃（没机会记结果）
- *   不受影响：官方恢复时记成未知结果，问题转入 continued。
+ * - 宿主正常关闭（SIGTERM）→ 试着发 question/closed（reason=interrupted）。DSH 关闭时整棵插件树并发释放，
+ *   官方问答服务自己把前台等待以 ASK_ABORTED 中止；但这时 HTTP 面正在关闭，这一帧能不能送到客户端不确定。
+ *   落盘结果与运行中被杀一样：只要 tool/call 已经写进会话日志，这次调用就没有工具结果，恢复会话后官方把它
+ *   记成未知结果，问题转入 continued，仍能回答（实测，SIGTERM 与 SIGKILL 结果相同）。界面上的 interrupted
+ *   文案只是「这一帧送到了」时的兜底说法。
  *
  * 不是经宿主打开的根会话、或请求不带工具调用 id（legacy 调用、程序化提问）时交给下一个应答者，
  * 没有下一个就按官方的「无人应答」失败关闭。子 Agent 不能提问是官方规则（DELEGATED_CALLER），到不了这里。

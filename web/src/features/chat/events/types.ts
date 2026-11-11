@@ -231,7 +231,8 @@ export interface QuestionAnswerView {
 }
 
 /**
- * 关闭原因：timeout 等待超时；cancelled 回合取消；interrupted 运行时正常重启时官方把等待中止了；
+ * 关闭原因：timeout 等待超时；cancelled 回合取消；interrupted 运行时正常重启时官方把等待中止了
+ * （这一帧能不能在停机前送到不确定，没送到的话恢复后问题会变成 continued、还能回答）；
  * expired 本页提交时后端说问题已结束。四种都不能再在卡片上回答。
  */
 export type QuestionClosedReason = 'timeout' | 'cancelled' | 'interrupted' | 'expired';
