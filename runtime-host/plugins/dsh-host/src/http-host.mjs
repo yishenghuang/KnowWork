@@ -533,6 +533,22 @@ export function apply(ctx, config) {
     return service
   }
 
+  /**
+   * 本空间的定时任务条数：业务服务建任务前要先算这个空间已经有几条（上限 100），但不需要看到任何任务内容。
+   * 因此这个分支只认空间头——不认用户头，也不按人过滤：数的是一个空间的总数。返回值里只有 total。
+   */
+  async function countSchedules(headers) {
+    const workspaceId = headers[OWNER_WORKSPACE_HEADER]
+    if (typeof workspaceId !== 'string' || workspaceId.length === 0 || workspaceId.length > 128) {
+      throw new HttpError(400, 'invalid_request', `${OWNER_WORKSPACE_HEADER} 必须是 1 到 128 个字符的字符串`)
+    }
+    const owners = ctx.get('knowworkOwners')
+    if (owners === undefined) throw new HttpError(503, 'schedule_unavailable', '宿主没有挂载属主账本')
+    const all = await scheduleService().catalog()
+    const total = all.filter(entry => owners.ownerOf('schedule', entry.id)?.workspaceId === workspaceId).length
+    return { total }
+  }
+
   /** 官方「找不到」的样子（{id, code:'schedule_not_found'}）在这里就是 404；归属不对时适配层也回这个。 */
   function found(result) {
     if (result?.code === 'schedule_not_found') throw new HttpError(404, 'schedule_not_found', '没有这个定时任务')
@@ -676,6 +692,11 @@ export function apply(ctx, config) {
     if (req.method === 'POST' && path === '/v1/sessions') return send(res, 201, await openSession(await readJson(req)))
     if (req.method === 'PUT' && path === '/v1/model-credential') return send(res, 200, await rotateModelCredential(await readJson(req)))
     if (req.method === 'GET' && path === '/v1/skills/bundled') return send(res, 200, bundledSkills())
+
+    // 只数条数：只认空间头，不认用户头，也不回任何任务内容
+    if (req.method === 'GET' && path === '/v1/schedule' && url.searchParams.get('countOnly') === 'true') {
+      return send(res, 200, await countSchedules(req.headers))
+    }
 
     // 定时任务读侧：GET /v1/schedule、GET /v1/schedule/{id}、GET /v1/schedule/{id}/history
     if (req.method === 'GET' && (path === '/v1/schedule' || path.startsWith('/v1/schedule/'))) {

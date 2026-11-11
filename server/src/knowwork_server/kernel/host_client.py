@@ -45,6 +45,9 @@ _ERRORS = {"session_not_found": SessionNotFound, "session_busy": SessionBusy, "e
 CONTROL_TIMEOUT = httpx.Timeout(30.0)
 STREAM_TIMEOUT = httpx.Timeout(30.0, read=15.0)
 
+# 只按空间计数时带这一个头：宿主那边的计数路由不接受用户头
+OWNER_WORKSPACE_HEADER = "x-knowwork-owner-workspace"
+
 
 def _raise_for(response: httpx.Response) -> None:
     if response.is_success:
@@ -238,6 +241,26 @@ class HostKernel:
             params["before"] = before
         path = f"/v1/schedule/{_segment(schedule_id)}/history"
         response = await self._client.get(path, params=params, headers=_owner_headers(owner))
+        _raise_for(response)
+        return response.json()
+
+    async def create_schedule(self, body: dict, *, owner: SessionOwner) -> dict:
+        """替这个人建一条定时任务。body 已经是宿主认的形状（title/prompt/timing/target）。"""
+        response = await self._client.post("/v1/schedule", json=body, headers=_owner_headers(owner))
+        _raise_for(response)
+        return response.json()
+
+    async def edit_schedule(self, schedule_id: str, body: dict, *, owner: SessionOwner) -> dict:
+        """改一条定时任务：body 是 {action, patch?, expectedUpdatedAt?}。"""
+        path = f"/v1/schedule/{_segment(schedule_id)}"
+        response = await self._client.patch(path, json=body, headers=_owner_headers(owner))
+        _raise_for(response)
+        return response.json()
+
+    async def count_schedules(self, *, workspace_id: str) -> dict:
+        """本空间的定时任务条数。宿主只回 {total}，不回任何任务内容。"""
+        headers = {OWNER_WORKSPACE_HEADER: workspace_id}
+        response = await self._client.get("/v1/schedule", params={"countOnly": "true"}, headers=headers)
         _raise_for(response)
         return response.json()
 

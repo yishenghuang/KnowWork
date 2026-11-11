@@ -58,6 +58,31 @@ export interface AutomationHistory {
   readonly earlierRecordsUnavailable: boolean;
 }
 
+/** 任务跑在哪儿：固定对话（页面替你建一个后台对话）、每次新建对话，或指定某段对话。 */
+export interface AutomationTarget {
+  readonly kind: 'fixed' | 'new_once' | 'session';
+  /** 只有 kind 为 session 时用得上。 */
+  readonly sessionId?: string;
+}
+
+/** 新建一条任务要填的东西。 */
+export interface AutomationInput {
+  readonly title: string;
+  readonly prompt: string;
+  readonly rrule: string;
+  readonly target: AutomationTarget;
+}
+
+/** 改一条任务：只带要改的字段；带 expectedUpdatedAt 时服务端会拦住别人先改过的情形。 */
+export interface AutomationPatch {
+  readonly title?: string;
+  readonly prompt?: string;
+  readonly rrule?: string;
+  readonly target?: AutomationTarget;
+  readonly active?: boolean;
+  readonly expectedUpdatedAt?: string;
+}
+
 const STATUSES: readonly AutomationStatus[] = ['active', 'paused', 'ended'];
 
 const base = (path = '') => workspacePath(`/automations${path}`);
@@ -104,6 +129,26 @@ function required(value: unknown): Automation {
   return automation;
 }
 
+/** 保存成功后业务服务只回这几样（宿主的完整记录由列表接口再读一遍），所以不复用 parseAutomation 编造其余字段。 */
+export interface SavedAutomation {
+  readonly id: string;
+  readonly scheduledAt: string | null;
+  readonly origin: AutomationOrigin;
+  readonly updatedAt: string | null;
+}
+
+function parseSaved(value: unknown): SavedAutomation {
+  if (!isRecord(value)) throw new Error('定时任务数据格式不对');
+  const id = text(value.id);
+  if (!id) throw new Error('定时任务数据格式不对');
+  return {
+    id,
+    scheduledAt: text(value.scheduledAt) ?? null,
+    origin: value.origin === 'page' ? 'page' : 'chat',
+    updatedAt: text(value.updatedAt) ?? null,
+  };
+}
+
 /** 我的定时任务。宿主那边已经按调用者筛过，这里拿到的都是自己的。 */
 export async function listAutomations(): Promise<AutomationPage> {
   const body = await request<unknown>(base());
@@ -115,6 +160,18 @@ export async function listAutomations(): Promise<AutomationPage> {
     limit: typeof body.limit === 'number' ? body.limit : items.length,
     offset: typeof body.offset === 'number' ? body.offset : 0,
   };
+}
+
+/** 新建一条任务。时间规则原文由 features/automations/model.ts 按预设算好传进来。 */
+export async function createAutomation(input: AutomationInput): Promise<SavedAutomation> {
+  const body = await request<unknown>(base(), { method: 'POST', body: input });
+  return parseSaved(body);
+}
+
+/** 改一条任务；要防别人刚改过就带上 expectedUpdatedAt。 */
+export async function updateAutomation(id: string, patch: AutomationPatch): Promise<SavedAutomation> {
+  const body = await request<unknown>(base(`/${seg(id)}`), { method: 'PATCH', body: patch });
+  return parseSaved(body);
 }
 
 export async function getAutomation(id: string): Promise<Automation> {

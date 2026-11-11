@@ -7,6 +7,9 @@
  *
  * 宿主暂时不可用时是「暂时读不到」，不是「没有任务」：读失败和读到空必须分得开，
  * 否则用户会以为自己的定时任务被删了（plan-2 §4.5）。
+ *
+ * 新建与编辑共用 AutomationForm：新建给空表单，编辑按 parseRule 把那条规则回填成同一预设，
+ * 提交时带上列表里看到的 updatedAt——期间别人改过就 409，提示刷新而不是把别人的改动盖掉。
  */
 import { useState } from 'react';
 import { Button } from '@openai/apps-sdk-ui/components/Button';
@@ -20,7 +23,8 @@ import { Skeleton } from '../../ui/Skeleton';
 import { Table, type Column } from '../../ui/Table';
 import { Tabs } from '../../ui/Tabs';
 import { formatDateTime } from '../../utils/format';
-import { AdminPage } from '../admin/AdminPage';
+import { AdminPage, Toolbar } from '../admin/AdminPage';
+import AutomationForm from './AutomationForm';
 import { scheduleText, STATUS_TEXT } from './model';
 import { useAutomationHistory, useAutomations } from './queries';
 
@@ -63,11 +67,24 @@ const RECORD_COLUMNS: readonly Column<RecordRow>[] = [
   },
 ];
 
+/** 表单开着的时候编辑哪一条：'new' 是新建，一条任务就是改它。 */
+type Editing = Automation | 'new';
+
 export default function AutomationsPage() {
   const [params, setParams] = useSearchParams();
+  const [editing, setEditing] = useState<Editing | undefined>(undefined);
+  const openCreate = () => setEditing('new');
   const items = [
-    { key: 'page', label: '页面上建的', children: <AutomationList origin="page" /> },
-    { key: 'chat', label: '对话里设的提醒', children: <AutomationList origin="chat" /> },
+    {
+      key: 'page',
+      label: '页面上建的',
+      children: <AutomationList origin="page" onEdit={setEditing} />,
+    },
+    {
+      key: 'chat',
+      label: '对话里设的提醒',
+      children: <AutomationList origin="chat" onEdit={setEditing} />,
+    },
   ];
   const value = items.find((item) => item.key === params.get('tab'))?.key ?? 'page';
   return (
@@ -75,12 +92,33 @@ export default function AutomationsPage() {
       title="自动化"
       description="到点就替你做的任务。页面上建的、在对话里让我设成提醒的，分两栏放；点一行能看它投递过几次、投到了哪里。"
     >
+      <Toolbar
+        right={
+          <Button color="primary" onClick={openCreate}>
+            新建任务
+          </Button>
+        }
+      />
       <Tabs items={items} value={value} onChange={(tab) => setParams({ tab }, { replace: true })} />
+      {/* key：换一条任务要重新挂载，useForm 的初值只在挂载时读一次 */}
+      {editing ? (
+        <AutomationForm
+          key={editing === 'new' ? 'new' : editing.id}
+          task={editing === 'new' ? undefined : editing}
+          onClose={() => setEditing(undefined)}
+        />
+      ) : null}
     </AdminPage>
   );
 }
 
-function AutomationList({ origin }: { readonly origin: Automation['origin'] }) {
+function AutomationList({
+  origin,
+  onEdit,
+}: {
+  readonly origin: Automation['origin'];
+  readonly onEdit: (task: Automation) => void;
+}) {
   const automations = useAutomations();
   const [opened, setOpened] = useState<Automation | undefined>(undefined);
 
@@ -106,6 +144,25 @@ function AutomationList({ origin }: { readonly origin: Automation['origin'] }) {
   const rows = all.filter((task) => task.origin === origin);
   const columns: readonly Column<Automation>[] = [
     ...COLUMNS,
+    {
+      key: 'edit',
+      title: '编辑',
+      width: 80,
+      render: (task) => (
+        <Button
+          color="secondary"
+          variant="ghost"
+          size="sm"
+          onClick={(event) => {
+            // 行本身也能点开投递记录，按钮不要再冒泡触发一次
+            event.stopPropagation();
+            onEdit(task);
+          }}
+        >
+          编辑
+        </Button>
+      ),
+    },
     {
       key: 'history',
       title: '投递记录',
@@ -133,7 +190,7 @@ function AutomationList({ origin }: { readonly origin: Automation['origin'] }) {
         rowKey={(task) => task.id}
         columns={columns}
         rows={rows}
-        minWidth={780}
+        minWidth={860}
         loading={automations.isFetching}
         onRowClick={setOpened}
         empty={all.length === 0 ? '还没有定时任务' : '这一栏里还没有任务'}
