@@ -6,7 +6,13 @@
  */
 import type { ReactNode } from 'react';
 import { Button } from '@openai/apps-sdk-ui/components/Button';
-import { Bolt, ComposeEditSquare, Search, Sidebar as SidebarIcon } from '@openai/apps-sdk-ui/components/Icon';
+import {
+  Bolt,
+  ComposeEditSquare,
+  Pulse,
+  Search,
+  Sidebar as SidebarIcon,
+} from '@openai/apps-sdk-ui/components/Icon';
 import { Tooltip } from '@openai/apps-sdk-ui/components/Tooltip';
 import { NavLink, useMatch } from 'react-router';
 import { DEFAULT_MARK } from '../api/system';
@@ -158,6 +164,7 @@ export function Sidebar() {
         </Tooltip>
       ) : null}
       <Entry to="/skills" icon={<Bolt />} label="技能" collapsed={collapsed} />
+      <Entry to="/automations" icon={<Pulse />} label="自动化" collapsed={collapsed} />
       {slotItems('app.nav').map((item) => (
         <Entry key={item.to} to={item.to} icon={item.icon} label={item.label} collapsed={collapsed} />
       ))}

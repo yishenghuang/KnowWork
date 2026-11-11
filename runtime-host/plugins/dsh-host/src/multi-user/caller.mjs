@@ -13,7 +13,7 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { resolveRootSession } from '../state.mjs'
 
 /** @typedef {{ workspaceId: string, userId: string }} Owner */
-/** @typedef {{ sessionId: string, owner: Owner }} Caller */
+/** @typedef {{ sessionId?: string, owner: Owner }} Caller 读路径（HTTP 的「我的任务」）只要属主，不用对话 */
 
 /** @type {AsyncLocalStorage<Caller>} */
 const store = new AsyncLocalStorage()
@@ -29,6 +29,17 @@ export function trackCallers(ctx) {
 /** @returns {Caller | undefined} 正在执行的工具的调用者；不在工具执行里（宿主内部的定时器等）是 undefined */
 export function currentCaller() {
   return store.getStore()
+}
+
+/**
+ * 显式以某个调用者的身份跑一段活：HTTP 路由不在 tools/execute 里，业务服务要读「我的任务」时用这个包住服务调用。
+ * @template T
+ * @param {Caller} caller
+ * @param {() => T} fn
+ * @returns {T}
+ */
+export function runAs(caller, fn) {
+  return store.run(caller, fn)
 }
 
 /** @returns {Caller | undefined} */

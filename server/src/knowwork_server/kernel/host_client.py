@@ -27,8 +27,10 @@ from .contract import (
     Question,
     QuestionAnswer,
     QuestionOption,
+    ScheduleNotFound,
     SessionBusy,
     SessionNotFound,
+    SessionOwner,
     SessionSpec,
     TurnAttachment,
     TurnInput,
@@ -37,7 +39,8 @@ from .locale import resolve_turn_language
 
 log = logging.getLogger(__name__)
 
-_ERRORS = {"session_not_found": SessionNotFound, "session_busy": SessionBusy, "epoch_mismatch": EpochMismatch}
+_ERRORS = {"session_not_found": SessionNotFound, "session_busy": SessionBusy, "epoch_mismatch": EpochMismatch,
+           "schedule_not_found": ScheduleNotFound}
 
 CONTROL_TIMEOUT = httpx.Timeout(30.0)
 STREAM_TIMEOUT = httpx.Timeout(30.0, read=15.0)
@@ -59,6 +62,13 @@ def _raise_for(response: httpx.Response) -> None:
 def _segment(value: str) -> str:
     """路径参数一律整段编码，`/`、`?` 等字符不能改变请求的路由。"""
     return quote(value, safe="")
+
+
+def _owner_headers(owner: SessionOwner | None) -> dict[str, str]:
+    """读「我的定时任务」时声明是谁在问（宿主用共享令牌认证，二者都是内网可信面）；不给就是管理端全量读。"""
+    if owner is None:
+        return {}
+    return {"x-knowwork-owner-workspace": owner.workspace_id, "x-knowwork-owner-user": owner.user_id}
 
 
 def _question(raw: dict) -> Question:
@@ -205,6 +215,31 @@ class HostKernel:
         _raise_for(response)
         return tuple(BundledSkill(name=s["name"], description=s["description"], user_invocable=s.get("userInvocable", True))
                      for s in response.json()["skills"])
+
+    async def list_schedules(self, *, owner: SessionOwner | None, limit: int = 100, offset: int = 0,
+                            active: bool | None = None) -> dict:
+        """我的定时任务。owner 是当前这个人：宿主按它过滤，别人的任务不会出现。"""
+        params: dict[str, str | int] = {"limit": limit, "offset": offset}
+        if active is not None:
+            params["active"] = "true" if active else "false"
+        response = await self._client.get("/v1/schedule", params=params, headers=_owner_headers(owner))
+        _raise_for(response)
+        return response.json()
+
+    async def view_schedule(self, schedule_id: str, *, owner: SessionOwner | None) -> dict:
+        response = await self._client.get(f"/v1/schedule/{_segment(schedule_id)}", headers=_owner_headers(owner))
+        _raise_for(response)
+        return response.json()
+
+    async def schedule_history(self, schedule_id: str, *, owner: SessionOwner | None, limit: int = 20,
+                               before: str | None = None) -> dict:
+        params: dict[str, str | int] = {"limit": limit}
+        if before is not None:
+            params["before"] = before
+        path = f"/v1/schedule/{_segment(schedule_id)}/history"
+        response = await self._client.get(path, params=params, headers=_owner_headers(owner))
+        _raise_for(response)
+        return response.json()
 
     async def subscribe(self, session_id: str, *, after: int = 0, epoch: str | None = None) -> AsyncIterator[KernelEvent]:
         params: dict[str, str | int] = {"after": after}

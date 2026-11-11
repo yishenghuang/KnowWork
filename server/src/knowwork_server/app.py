@@ -28,6 +28,7 @@ from .attachments.api import build_router as attachments_router
 from .attachments.turns import TurnAttachments
 from .audit import AUDIT_SCOPE, AuditModule, build_audit
 from .audit import build_router as audit_router
+from .automations.api import build_router as automations_router
 from .channels import Channels, build_channels
 from .channels import build_router as channels_router
 from .config import Settings
@@ -578,6 +579,8 @@ def create_public_app(runtime: Runtime) -> FastAPI:
     actor = conversation_actor(identity, access)
     app.include_router(mention_router(runtime.mention_sources, actor))  # 排在会话路由前，见 mention_api
     app.include_router(conversation_router(runtime.service, actor, runtime.feedback))
+    # 自动化页读我的定时任务：任务在宿主里，这里只转达并按执行位置判定视图（见 automations/api.py）
+    app.include_router(automations_router(runtime.kernel, actor, runtime.service))
     app.include_router(build_answer_modes_router(runtime.answer_modes, actor))
     app.include_router(citations_router(runtime.knowledge.citations, runtime.service, actor, runtime.links))
     app.include_router(debug_router(runtime.debug, runtime.service, actor))

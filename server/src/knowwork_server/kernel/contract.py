@@ -263,6 +263,10 @@ class EpochMismatch(KernelError):
     """宿主重启过，旧游标失效。调用方应从头重新读取。"""
 
 
+class ScheduleNotFound(KernelError):
+    """宿主上没有这个定时任务：不存在，或者不是当前这个人的（归属过滤后两者同样回这个码）。"""
+
+
 class AgentKernel(Protocol):
     async def open_session(self, spec: SessionSpec) -> str: ...
 

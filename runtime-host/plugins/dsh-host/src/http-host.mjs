@@ -27,6 +27,7 @@ import { catalogOf } from './knowledge-catalog.mjs'
 import { mentionBlocks, mentionsOf } from './mentions.mjs'
 import { receiveTurnContext, turnContextOf } from './turn-context.mjs'
 import { BUILT_IN_MODES, MODE_PATTERN, answerModeSpecOf } from './answer-mode.mjs'
+import { runAs } from './multi-user/caller.mjs'
 import { deploymentTimeZone, userSource } from './message-source.mjs'
 
 // DSH 版本号随 /health 一起报给业务服务，系统信息页显示（所有 @deepseek-ai 包锁在同一版本）
@@ -40,6 +41,11 @@ const CANCEL_SETTLE_MS = 5000
 const MAX_BODY_BYTES = 1024 * 1024
 const MAX_SUBSCRIBERS_PER_SESSION = 8
 const SESSION_ID_PATTERN = /^[A-Za-z0-9_.:-]{1,128}$/
+// 定时任务 id 是官方给的 schedule-<uuid>，取值范围和会话 id 一样
+const SCHEDULE_ID_PATTERN = /^[A-Za-z0-9_.:-]{1,128}$/
+// 业务服务在请求头里声明这次是谁在问（宿主用共享令牌认证，二者都是内网可信面）
+const OWNER_WORKSPACE_HEADER = 'x-knowwork-owner-workspace'
+const OWNER_USER_HEADER = 'x-knowwork-owner-user'
 const CREDENTIAL_ACTIONS = new Set(['tool-credential', 'skill-credential'])
 
 class HttpError extends Error {
@@ -96,6 +102,12 @@ function sessionIdOf(raw) {
   return id
 }
 
+function scheduleIdOf(raw) {
+  const id = segmentOf(raw)
+  if (!SCHEDULE_ID_PATTERN.test(id)) throw new HttpError(400, 'invalid_request', 'scheduleId 只允许字母、数字和 _.:-，最长 128')
+  return id
+}
+
 /** 回答校验不通过统一成 400 invalid_answer，原因写进 message（业务服务只记日志，不给用户看）。 */
 function validated(check) {
   try {
@@ -112,6 +124,26 @@ function segmentOf(raw) {
   } catch {
     throw new HttpError(400, 'invalid_request', '路径参数编码错误')
   }
+}
+
+/**
+ * 业务服务在请求头里声明的调用者：两个头都在 = 某个人的「我的任务」，两个都不在 = 管理端全量读，只给一个是不完整的。
+ * @returns {import('./multi-user/caller.mjs').Owner | undefined}
+ */
+function callerOwnerOf(headers) {
+  const field = (name, header) => {
+    const value = headers[header]
+    if (value === undefined) return undefined
+    if (typeof value !== 'string' || value.length === 0 || value.length > 128) {
+      throw new HttpError(400, 'invalid_request', `${header} 必须是 1 到 128 个字符的字符串`)
+    }
+    return value
+  }
+  const workspaceId = field('workspaceId', OWNER_WORKSPACE_HEADER)
+  const userId = field('userId', OWNER_USER_HEADER)
+  if (workspaceId === undefined && userId === undefined) return undefined
+  if (workspaceId === undefined || userId === undefined) throw new HttpError(400, 'invalid_request', '调用者身份不完整')
+  return { workspaceId, userId }
 }
 
 function policyOf(raw) {
@@ -484,6 +516,63 @@ export function apply(ctx, config) {
     }
   }
 
+  /**
+   * 定时任务读侧：业务服务的「自动化」页要列「我的任务」、看单条、看投递记录，而任务存在宿主里的官方
+   * schedule 服务，业务服务摸不到。这里只把三个读方法转出去（归属过滤在适配层 schedule.mjs 里，照调用者算）：
+   * - 带调用者身份头的请求用 runAs 包住，官方服务的 list/guard 就只看这个人的；
+   * - 不带身份头的是管理端全量读。
+   * 增删改与立即运行留给之后（见 plan-2 的写侧路由）。
+   */
+  function scheduleService() {
+    const service = ctx.get('schedule')
+    if (service === undefined) throw new HttpError(503, 'schedule_unavailable', '宿主没有挂载定时任务服务')
+    return service
+  }
+
+  /** 官方「找不到」的样子（{id, code:'schedule_not_found'}）在这里就是 404；归属不对时适配层也回这个。 */
+  function found(result) {
+    if (result?.code === 'schedule_not_found') throw new HttpError(404, 'schedule_not_found', '没有这个定时任务')
+    return result
+  }
+
+  /** 有调用者身份就按他跑（适配层据此过滤）——没有就是管理端全量读。 */
+  async function asCaller(owner, fn) {
+    try {
+      return await (owner === undefined ? fn() : runAs({ owner }, fn))
+    } catch (error) {
+      // 官方的输入校验（limit、offset 不合规）是请求本身不合规，不是宿主出错
+      if (error instanceof Error && error.name === 'ScheduleInputError') {
+        throw new HttpError(400, 'invalid_request', error.message)
+      }
+      throw error
+    }
+  }
+
+  function listSchedules(owner, url) {
+    const query = url.searchParams
+    const limit = query.get('limit')
+    const offset = query.get('offset')
+    const active = query.get('active')
+    return asCaller(owner, () => scheduleService().remoteList({
+      ...(limit === null ? {} : { limit: Number(limit) }),
+      ...(offset === null ? {} : { offset: Number(offset) }),
+      ...(active === null ? {} : { active: active === 'true' }),
+    }))
+  }
+
+  function viewSchedule(owner, id) {
+    return asCaller(owner, () => scheduleService().view({ id })).then(found)
+  }
+
+  /** 先判归属再看投递记录：别人的任务连记录条数都不该问得出来。 */
+  async function scheduleHistory(owner, id, url) {
+    await viewSchedule(owner, id)
+    const limit = Number(url.searchParams.get('limit') ?? 20)
+    const before = url.searchParams.get('before')
+    return asCaller(owner, () => scheduleService().history({ id, limit, ...(before === null ? {} : { before }) }))
+      .then(found)
+  }
+
   async function route(req, res) {
     const url = new URL(req.url ?? '/', 'http://host')
     const path = url.pathname
@@ -493,6 +582,18 @@ export function apply(ctx, config) {
     if (req.method === 'POST' && path === '/v1/sessions') return send(res, 201, await openSession(await readJson(req)))
     if (req.method === 'PUT' && path === '/v1/model-credential') return send(res, 200, await rotateModelCredential(await readJson(req)))
     if (req.method === 'GET' && path === '/v1/skills/bundled') return send(res, 200, bundledSkills())
+
+    // 定时任务读侧：GET /v1/schedule、GET /v1/schedule/{id}、GET /v1/schedule/{id}/history
+    if (req.method === 'GET' && (path === '/v1/schedule' || path.startsWith('/v1/schedule/'))) {
+      const owner = callerOwnerOf(req.headers)
+      if (path === '/v1/schedule') return send(res, 200, await listSchedules(owner, url))
+      const [rawId, action, extra] = path.slice('/v1/schedule/'.length).split('/')
+      if (rawId === undefined || rawId === '') throw new HttpError(404, 'not_found', '路径不存在')
+      const scheduleId = scheduleIdOf(rawId)
+      if (action === undefined) return send(res, 200, await viewSchedule(owner, scheduleId))
+      if (action === 'history' && extra === undefined) return send(res, 200, await scheduleHistory(owner, scheduleId, url))
+      throw new HttpError(404, 'not_found', '路径不存在')
+    }
 
     const match = /^\/v1\/sessions\/([^/]+)(?:\/([^/]+)(?:\/([^/]+))?)?$/.exec(path)
     if (match === null) throw new HttpError(404, 'not_found', '路径不存在')

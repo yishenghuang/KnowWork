@@ -17,6 +17,7 @@ const InvitePage = lazy(() => import('../features/auth/InvitePage'));
 const SetupPage = lazy(() => import('../features/auth/SetupPage'));
 const SettingsPage = lazy(() => import('../features/settings/SettingsPage'));
 const MySkillsPage = lazy(() => import('../features/skills/SkillsPage'));
+const AutomationsPage = lazy(() => import('../features/automations/AutomationsPage'));
 const SkillsPage = lazy(() => import('../features/admin/skills/SkillsPage'));
 const ChannelsPage = lazy(() => import('../features/admin/channels/ChannelsPage'));
 const MembersPage = lazy(() => import('../features/admin/members/MembersPage'));
@@ -77,6 +78,7 @@ export const buildRoutes = (): RouteObject[] => [
       { path: 'chat/:conversationId', element: page(<ChatPage />) },
       { path: 'settings', element: page(<SettingsPage />) },
       { path: 'skills', element: page(<MySkillsPage />) },
+      { path: 'automations', element: page(<AutomationsPage />) },
       ...slotItems('app.routes'),
       { path: '*', element: <Navigate to="/chat" replace /> },
     ],

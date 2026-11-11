@@ -43,6 +43,9 @@ const OwnedSchedule = ownedService(ScheduleService, {
   guard: {
     view: { id: request => request.id, notFound },
     edit: { id: request => request.id, notFound },
+    // 立即运行与投递记录同样按 id 读写单个任务：不是调用者的照官方「找不到」返回
+    run: { id: request => request.id, notFound },
+    history: { id: request => request.id, notFound },
   },
 })
 
