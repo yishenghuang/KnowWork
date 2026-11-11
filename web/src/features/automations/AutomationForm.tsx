@@ -17,6 +17,7 @@ import {
   createAutomation,
   updateAutomation,
   type Automation,
+  type AutomationDraft,
   type AutomationPatch,
   type AutomationTarget,
 } from '../../api/automations';
@@ -27,6 +28,7 @@ import { Field } from '../../ui/Field';
 import { rule, useForm } from '../../ui/form';
 import { NumberInput } from '../../ui/NumberInput';
 import { toast } from '../../ui/toastStore';
+import AssistantBox from './AssistantBox';
 import { buildRules, describeRule, parseRule, type Preset, type Weekday } from './model';
 import { AUTOMATION_KEYS } from './queries';
 
@@ -256,6 +258,25 @@ export function AutomationForm({
 
   const ruleProblem = problem?.where === 'rule' ? problem.message : undefined;
 
+  /**
+   * 把「一句话生成」的草稿填进表单：只填空、只覆盖模型明确给出的字段（AC2），
+   * 时间规则认不出预设就交给 parseRule 落成「自定义」（AC4）。这条路上不建任务（AC3）。
+   */
+  const applyDraft = (draft: AutomationDraft) => {
+    if (draft.title) form.set('title', draft.title);
+    if (draft.prompt) form.set('prompt', draft.prompt);
+    const timing = draft.timing;
+    if (timing) {
+      setDraft(draftOf('preset' in timing ? timing.preset : parseRule(timing.rrule)));
+      setProblem((current) => (current?.where === 'rule' ? undefined : current));
+    }
+    if (draft.target) {
+      setPlace(draft.target);
+      setPlaceTouched(true);
+    }
+    toast.success('草稿填好了，看一眼再点保存');
+  };
+
   const submit = async () => {
     const values = form.validate();
     if (!values) return;
@@ -330,6 +351,8 @@ export function AutomationForm({
       onSubmit={() => void submit()}
       footer={<DialogActions okText={saving ? '正在保存' : '保存'} loading={saving} onCancel={onClose} />}
     >
+      {/* 只在新建时出现：编辑一条已有任务时不该让模型改它的规则 */}
+      {editing ? null : <AssistantBox timeZone={timeZone} onDraft={applyDraft} />}
       <Field label="标题" required error={form.errors.title}>
         {(id) => (
           <Input id={id} maxLength={120} placeholder="例如：每天九点提醒我写日报" {...form.text('title')} />

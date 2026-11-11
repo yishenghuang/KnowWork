@@ -30,6 +30,7 @@ from .audit import AUDIT_SCOPE, AuditModule, build_audit
 from .audit import build_router as audit_router
 from .automations.admin import build_router as automations_admin_router
 from .automations.api import build_router as automations_router
+from .automations.draft import build_router as automations_draft_router
 from .automations.internal import build_automation_conversation_router
 from .automations.supervisor import ScheduleSupervisor
 from .channels import Channels, build_channels
@@ -190,6 +191,7 @@ class Runtime:
     runs: RunRecords
     insights: InsightsService  # 问答大盘（空间所有者、管理员）
     summary_query: SummaryQuery  # 自动化页读「最近一次跑成没跑成」用（与运行记录列表同一份汇总）
+    chat: ModelClient  # 自动化页「一句话生成草稿」用（与 ApiContext.models 同一份）
     channels: Channels  # 渠道：企业微信等机器人
     jobs: JobsAdmin  # 运行面板
     parsers: DocumentParsers  # 文档解析服务的配置
@@ -496,9 +498,11 @@ def build_runtime(settings: Settings, *, extensions: Extensions | None = None) -
     links = LinkSigner(derive_key(master_key, "knowledge-links"))
     knowledge_reader_ = KnowledgeReader(knowledge.service, links)
     knowledge_mcp = KnowledgeMcp(knowledge_reader_, knowledge_reader(identity, access))
+    # 业务服务自己发起的模型调用（自动化的「一句话生成草稿」等）与 ApiContext 里的是同一份
+    model_client = ModelClient(models.catalog, routed_http)
     context = ApiContext(settings=settings, engine=engine, sessionmaker=scoped,
                          global_sessionmaker=global_sessionmaker, access=access,
-                         models=ModelClient(models.catalog, routed_http),
+                         models=model_client,
                          stores_for=lambda namespace: namespaced_stores(settings, namespace),
                          knowledge_sources=knowledge.provided, tools=provided_tools, turn_context=turn_context,
                          answer_modes=answer_modes, mentions=mention_kinds,
@@ -523,7 +527,7 @@ def build_runtime(settings: Settings, *, extensions: Extensions | None = None) -
                    debug=debug,
                    runs=build_run_records(scoped, models.recorder, debug, service, access, audit.sink,
                                           identity.users.get_many),
-                   summary_query=summary_query,
+                   summary_query=summary_query, chat=model_client,
                    insights=build_insights(scoped, access, timezone=settings.usage_timezone,
                                            base_names=partial(_base_names, knowledge.service)),
                    channels=build_channels(master_key, scoped, global_sessionmaker, held_engine, access, service,
@@ -594,6 +598,9 @@ def create_public_app(runtime: Runtime) -> FastAPI:
     app.include_router(automations_admin_router(runtime.kernel, access, scoped_principal(identity, WORKSPACE_SCOPE),
                                                 lookup=runtime.service, runs=runtime.summary_query,
                                                 profiles=identity.users.get_many))
+    # 自动化页的「一句话生成草稿」：只调一次模型产出草稿，不建任务。必须排在 /{schedule_id} 之前，
+    # 否则 /automations/draft 会被当成一个任务 id 收走（见 automations/draft.py）
+    app.include_router(automations_draft_router(runtime.chat, actor))
     # 自动化页读我的定时任务：任务在宿主里，这里只转达并按执行位置判定视图（见 automations/api.py）
     app.include_router(automations_router(runtime.kernel, actor, runtime.service, runs=runtime.summary_query,
                                          audit=runtime.audit.query))
