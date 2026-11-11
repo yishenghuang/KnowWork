@@ -9,7 +9,6 @@
  * 「跳过」在宿主里根本没有记录（到点时上一轮还在跑），是业务侧按「还在跑 + 已经过点」推出来的。
  * 这几条字段老版本服务端没有，解析一律容错——缺就是没有，显示成「还没有跑过」，不能让整条任务消失。
  */
-import type { Preset, Weekday } from '../features/automations/model';
 import { request, seg } from './http';
 import { bool, isRecord, listOf, str, text } from './parse';
 import { workspacePath } from './workspace';
@@ -95,14 +94,6 @@ export interface AutomationTarget {
   readonly kind: 'fixed' | 'new_once' | 'session';
   /** 只有 kind 为 session 时用得上。 */
   readonly sessionId?: string;
-}
-
-/** 新建一条任务要填的东西。 */
-export interface AutomationInput {
-  readonly title: string;
-  readonly prompt: string;
-  readonly rrule: string;
-  readonly target: AutomationTarget;
 }
 
 /** 改一条任务：只带要改的字段；带 expectedUpdatedAt 时服务端会拦住别人先改过的情形。 */
@@ -225,10 +216,22 @@ export async function listAutomations(): Promise<AutomationPage> {
   };
 }
 
-/** 新建一条任务。时间规则原文由 features/automations/model.ts 按预设算好传进来。 */
-export async function createAutomation(input: AutomationInput): Promise<SavedAutomation> {
-  const body = await request<unknown>(base(), { method: 'POST', body: input });
-  return parseSaved(body);
+/** 一次建出好几条任务（每天 9:00 与 18:30 这种）：标题与执行位置共用，只有时间规则各不相同。时间规则原文由 features/automations/model.ts 按预设算好传进来。 */
+export interface AutomationsInput {
+  readonly title: string;
+  readonly prompt: string;
+  readonly rules: readonly string[];
+  readonly target: AutomationTarget;
+}
+
+/**
+ * 一次建出一组任务：要么全建出来，要么一条都不留（服务端建到一半失败会把已建的回滚）。
+ * 表单里一个「每天 09:00、18:30」就是一个表单提交，不该在这里变成两条互不相干的任务。
+ */
+export async function createAutomations(input: AutomationsInput): Promise<readonly SavedAutomation[]> {
+  const body = await request<unknown>(base('/batch'), { method: 'POST', body: input });
+  if (!isRecord(body)) return [];
+  return listOf(body.items, parseSaved);
 }
 
 /** 改一条任务；要防别人刚改过就带上 expectedUpdatedAt。 */
@@ -298,117 +301,37 @@ function parseAdminAutomation(value: unknown): AdminAutomation | undefined {
   };
 }
 
+/** 管理端列表的筛选：创建者按用户 id，状态按宿主的三档。两项都不给就是本空间全部（票 #9 的 AC2）。 */
+export interface AdminAutomationQuery {
+  readonly creator?: string;
+  readonly status?: AutomationStatus;
+}
+
 export interface AdminAutomationPage {
   readonly items: readonly AdminAutomation[];
   readonly total: number;
+  /** 宿主里的任务多到翻不完，这一次只列出了前一部分：界面要如实说明，不能假装是全量（AC1）。 */
+  readonly truncated: boolean;
 }
 
-/** 管理端：本空间全部定时任务（含已暂停与已结束的）。只有空间所有者/管理员拿得到，普通用户是 403。 */
-export async function listAdminAutomations(): Promise<AdminAutomationPage> {
-  const body = await request<unknown>(base('/admin'));
-  if (!isRecord(body)) return { items: [], total: 0 };
+/**
+ * 管理端：本空间全部定时任务（含已暂停与已结束的）。只有空间所有者/管理员拿得到，普通用户是 403。
+ * 筛选交给服务端做：任务上万条时在前端过滤，翻页与总数都会失真。
+ */
+export async function listAdminAutomations(query: AdminAutomationQuery = {}): Promise<AdminAutomationPage> {
+  const body = await request<unknown>(base('/admin'), {
+    query: { creator: query.creator, status: query.status },
+  });
+  if (!isRecord(body)) return { items: [], total: 0, truncated: false };
   const items = listOf(body.items, parseAdminAutomation);
-  return { items, total: typeof body.total === 'number' ? body.total : items.length };
+  return {
+    items,
+    total: typeof body.total === 'number' ? body.total : items.length,
+    truncated: bool(body.truncated),
+  };
 }
 
 /** 管理端停用一条任务：到点不再触发。宿主只接受「停用」这一种改动，改内容仍由创建者自己做。 */
 export async function disableAdminAutomation(id: string): Promise<void> {
   await request<unknown>(base(`/admin/${seg(id)}/disable`), { method: 'POST' });
-}
-
-/** 草稿里的时间规则：能落进预设就给预设对象，落不进就是 RRULE 行原文（前端 parseRule 认不出就当「自定义」）。 */
-export type AutomationDraftTiming = { readonly preset: Preset } | { readonly rrule: string };
-
-/** 「一句话生成」回来的草稿：没给出的字段是 null，表单保持原样。生成草稿不会建任务。 */
-export interface AutomationDraft {
-  readonly title: string | null;
-  readonly prompt: string | null;
-  readonly timing: AutomationDraftTiming | null;
-  readonly target: 'fixed' | 'new_once' | null;
-  /** 给用户看的一句中文补充（例如「没完全听懂，只填了能确定的部分」）。 */
-  readonly note: string | null;
-}
-
-const EMPTY_DRAFT: AutomationDraft = { title: null, prompt: null, timing: null, target: null, note: null };
-
-const DRAFT_KINDS = ['once', 'minutes', 'hours', 'daily', 'workdays', 'weekly', 'monthly'] as const;
-
-/** 与 model.ts 的 WEEKDAYS 同序；这里只用来校验，不从那边 import 值，免得接口层依赖 feature 层。 */
-const DAYS: readonly string[] = ['MO', 'TU', 'WE', 'TH', 'FR', 'SA', 'SU'];
-
-/** 正整数；其余（含小数、字符串）都不要。 */
-function whole(value: unknown, min = 1): number | undefined {
-  return typeof value === 'number' && Number.isInteger(value) && value >= min ? value : undefined;
-}
-
-/** 'HH:mm'（24 小时制）。 */
-function clock(value: unknown): string | undefined {
-  const time = text(value);
-  if (!time || !/^\d{2}:\d{2}$/.test(time)) return undefined;
-  const [hour = '', minute = ''] = time.split(':');
-  return Number(hour) <= 23 && Number(minute) <= 59 ? time : undefined;
-}
-
-/**
- * 草稿里的预设：逐字段校验，任一项对不上就整条丢掉（服务端已经校验过一遍，这里是防着版本不一致）。
- * 校验不过的那一条不再退回 rrule——服务端会先替我们决定该走哪条路。
- */
-function parseDraftPreset(value: unknown): Preset | undefined {
-  if (!isRecord(value)) return undefined;
-  const kind = DRAFT_KINDS.find((k) => k === value.kind);
-  if (!kind) return undefined;
-  if (kind === 'once') {
-    const at = text(value.at);
-    return at && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(at) ? { kind, at } : undefined;
-  }
-  const every = whole(value.every);
-  if (every === undefined) return undefined;
-  if (kind === 'minutes' || kind === 'hours') return { kind, every };
-  if (kind === 'daily') {
-    const times = Array.isArray(value.times) ? value.times.map(clock) : [];
-    if (times.length === 0 || times.some((time) => time === undefined)) return undefined;
-    return { kind, every, times: times.filter((time) => time !== undefined) };
-  }
-  const time = clock(value.time);
-  if (!time) return undefined;
-  if (kind === 'workdays') return { kind, every, time };
-  if (kind === 'weekly') {
-    const days = (Array.isArray(value.days) ? value.days : [])
-      .map((day) => (typeof day === 'string' ? day.toUpperCase() : ''))
-      .filter((day): day is Weekday => DAYS.includes(day));
-    return days.length > 0 ? { kind, every, days, time } : undefined;
-  }
-  const day = whole(value.day, -1);
-  if (day === undefined || day === 0 || day > 31) return undefined;
-  return { kind: 'monthly', every, day, time };
-}
-
-function parseDraftTiming(value: unknown): AutomationDraftTiming | null {
-  if (!isRecord(value)) return null;
-  const preset = parseDraftPreset(value.preset);
-  if (preset) return { preset };
-  const rrule = text(value.rrule);
-  // 服务端只透出以 FREQ= 开头的原文；别的当没给
-  return rrule && rrule.startsWith('FREQ=') ? { rrule } : null;
-}
-
-function parseDraft(value: unknown): AutomationDraft {
-  if (!isRecord(value)) return EMPTY_DRAFT;
-  const target = value.target === 'fixed' || value.target === 'new_once' ? value.target : null;
-  return {
-    title: text(value.title) ?? null,
-    prompt: text(value.prompt) ?? null,
-    timing: parseDraftTiming(value.timing),
-    target,
-    note: text(value.note) ?? null,
-  };
-}
-
-/**
- * 一句话 → 表单草稿：业务服务调一次模型，把标题、提示词、时间规则、执行位置翻出来。
- * **这条路上不建任务**：用户改完点「保存」才真的建（AC3）。解析不出来就当全空，绝不让整张表单消失。
- */
-export async function draftAutomation(text: string, timeZone: string): Promise<AutomationDraft> {
-  const body = await request<unknown>(base('/draft'), { method: 'POST', body: { text, timeZone } });
-  return parseDraft(body);
 }

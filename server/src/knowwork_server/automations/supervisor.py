@@ -10,35 +10,49 @@
 """
 
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 import httpx
 
 from ..audit import AuditEvent, AuditSink, safe_record
 from ..conversations.summaries import SummaryQuery, TurnEnded
 from ..db.base import in_workspace
-from ..kernel.contract import KernelError, SessionOwner
-from ..kernel.host_client import HostKernel
+from ..kernel.contract import KernelError, ScheduleKernel, SessionOwner
+from . import limits
 
 log = logging.getLogger(__name__)
 
-# 连续到第几次就停。判据是「本轮 + 历史两条」，所以窗里读 limit=2 条历史。
-FAILURE_LIMIT = 3
-# 与 api.RUN_WINDOW 一致：更早的汇总对「最近几次」没有意义。
-HISTORY_WINDOW = timedelta(days=30)
+# 阈值、窗口与审计用词都在 limits 里（api 读同几个值给前端，别处再写一遍就会两边漂移）
+FAILURE_LIMIT = limits.FAILURE_LIMIT
+HISTORY_WINDOW = limits.RUN_WINDOW
 # 审计 detail 的 reason 用这个标量键；sanitize_detail 会丢掉命中正文词 / 凭据词的键，这里都是安全键。
-PAUSE_REASON = "连续 3 次运行失败，已自动暂停"
-AUDIT_ACTION = "automation.auto_paused"
+PAUSE_REASON = limits.AUDIT_PAUSE_REASON
+AUDIT_ACTION = limits.AUDIT_PAUSE_ACTION
+
+
+def _error_code(error: BaseException) -> str:
+    """宿主错误码（KernelError.code）；HTTP / 系统错误的类名顶上也够看。"""
+    code = getattr(error, "code", None)
+    return code if isinstance(code, str) and code else type(error).__name__
+
+
+def _event(ended: TurnEnded, task_id: str, result: str, detail: dict) -> AuditEvent:
+    return AuditEvent(
+        workspace_id=ended.workspace_id, actor_type="system", action=AUDIT_ACTION, result=result,
+        actor_id=ended.user_id, resource_type="automation", resource_id=task_id,
+        session_id=ended.conversation_id, detail=detail,
+    )
 
 
 class ScheduleSupervisor:
     """连续失败时把定时任务转为暂停，并记一条审计事件说明为什么停。
 
     作为 RunSummaries 的 Contributor（Callable[[TurnEnded], Awaitable[...]]）注册，只做副作用、恒返回 None。
-    宿主写失败只记日志、绝不向外抛：_facts 虽已吞掉 contributor 异常，这里仍显式保证不影响正常汇总。
+    宿主写失败绝不向外抛（_facts 虽已吞掉 contributor 异常，这里仍显式保证不影响正常汇总），但要留一条
+    result="failed" 的审计：自动暂停没停成，用户与管理员都得看得见。
     """
 
-    def __init__(self, runs: SummaryQuery, kernel: HostKernel, sink: AuditSink | None) -> None:
+    def __init__(self, runs: SummaryQuery, kernel: ScheduleKernel, sink: AuditSink | None) -> None:
         self._runs = runs
         self._kernel = kernel
         self._sink = sink
@@ -69,20 +83,19 @@ class ScheduleSupervisor:
         if len(rows) < FAILURE_LIMIT - 1 or not all(row.summary.status == "failed" for row in rows):
             return
 
+        # detail 全用标量键，避开 sanitize_detail 的正文词 / 凭据词过滤；成功与失败用同一组键，按 result 分辨。
+        detail: dict = {"reason": PAUSE_REASON, "failures": FAILURE_LIMIT, "scheduleId": task_id,
+                        "conversationId": ended.conversation_id}
         owner = SessionOwner(workspace_id=ended.workspace_id, user_id=ended.user_id)
         try:
             await self._kernel.edit_schedule(task_id, {"action": "update", "patch": {"active": False}},
                                              owner=owner)
-        except (KernelError, httpx.HTTPError, OSError):
+        except (KernelError, httpx.HTTPError, OSError) as error:
+            # 停下来这件事没做成，恰恰是最该留下痕迹的时候：调用者的权限可能已经被收走，任务还在按点跑。
+            # 记 result="failed" 并把宿主的错误码带进 detail，管理员在审计里能看见「该停没停成」。
             log.warning("auto-pause schedule %s failed", task_id, exc_info=True)
+            await safe_record(self._sink, _event(ended, task_id, "failed",
+                                                 {**detail, "error": _error_code(error)}))
             return
 
-        # 只有 edit 成功才留痕：detail 全用标量键，避开 sanitize_detail 的正文词 / 凭据词过滤。
-        event = AuditEvent(
-            workspace_id=ended.workspace_id, actor_type="system", action=AUDIT_ACTION, result="success",
-            actor_id=ended.user_id, resource_type="automation", resource_id=task_id,
-            session_id=ended.conversation_id,
-            detail={"reason": PAUSE_REASON, "failures": FAILURE_LIMIT, "scheduleId": task_id,
-                    "conversationId": ended.conversation_id},
-        )
-        await safe_record(self._sink, event)
+        await safe_record(self._sink, _event(ended, task_id, "success", detail))

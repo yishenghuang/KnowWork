@@ -14,23 +14,24 @@ afterEach(() => vi.unstubAllGlobals());
 const B = '/api/workspaces/default';
 const TZ = browserTimeZone() ?? 'Etc/UTC';
 const DRAFT = `${B}/automations/draft`;
-const CREATE = `${B}/automations`;
+const CREATE = `${B}/automations/batch`;
 
 /** 草稿接口的返回：没提到的字段就是 null。 */
 const draft = (over: Record<string, unknown> = {}) =>
   jsonResponse({ title: null, prompt: null, timing: null, target: null, note: null, ...over });
 
-/** 保存成功后业务服务只回这四样。 */
+/** 保存成功后业务服务只回这四样；批量接口外面再包一层 items。 */
 const saved = (id = 'schedule-new') =>
-  jsonResponse(
-    {
-      id,
-      scheduledAt: '2026-11-13T01:00:00+00:00',
-      origin: 'page',
-      updatedAt: '2026-11-02T00:00:00+00:00',
-    },
-    201,
-  );
+  jsonResponse({
+    items: [
+      {
+        id,
+        scheduledAt: '2026-11-13T01:00:00+00:00',
+        origin: 'page',
+        updatedAt: '2026-11-02T00:00:00+00:00',
+      },
+    ],
+  });
 
 function setup(extra: Record<string, unknown> = {}) {
   const fetch = routeFetch({
@@ -130,9 +131,10 @@ describe('用一句话生成草稿', () => {
       expect(found).toHaveLength(1);
       return found;
     });
-    const body = posts[0]!.body as { title: string; rrule: string; target: unknown };
+    const body = posts[0]!.body as { title: string; rules: readonly string[]; target: unknown };
     expect(body.title).toBe('交日报');
-    expect(body.rrule.split('\n').at(-1)).toBe('RRULE:FREQ=DAILY;INTERVAL=1;BYHOUR=9;BYMINUTE=0');
+    expect(body.rules).toHaveLength(1);
+    expect(body.rules[0]!.split('\n').at(-1)).toBe('RRULE:FREQ=DAILY;INTERVAL=1;BYHOUR=9;BYMINUTE=0');
     expect(body.target).toEqual({ kind: 'new_once' });
   });
 
@@ -157,7 +159,9 @@ describe('用一句话生成草稿', () => {
       return found;
     });
     // 自定义那一条以用户写的为准，原样发出去
-    expect((posts[0]!.body as { rrule: string }).rrule.split('\n').at(-1)).toBe(rrule);
+    const rules = (posts[0]!.body as { rules: readonly string[] }).rules;
+    expect(rules).toHaveLength(1);
+    expect(rules[0]!.split('\n').at(-1)).toBe(rrule);
   });
 
   it('草稿只给了标题时，其余字段保持原样', async () => {

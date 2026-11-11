@@ -1,5 +1,6 @@
 """自动化页的写接口（automations/api.py）：新建与编辑定时任务。
 - 保存前先在本地拦三种情况：间隔小于 5 分钟、本人已有 20 条、本空间已有 100 条，并且**不往宿主发请求**；
+- 一次建多个时刻走批量口：要么全成，要么把已建的删掉；配额按这一次要建的合计判；
 - 「每次新建对话」的目标要带一枚属主令牌，宿主凭它认出这是谁的任务；编辑时沿用旧令牌，不每次换；
 - 「固定对话」由业务服务先建一段后台只读对话，再拿它当投递目标；
 - 指定对话必须是自己的，别人的当不存在（404）；
@@ -30,6 +31,8 @@ BASE = f"/api/workspaces/{WORKSPACE}/automations"
 
 RULE = "DTSTART;TZID=Asia/Shanghai:20990101T090000\nRRULE:FREQ=DAILY;COUNT=1"
 MINUTES_4 = "DTSTART;TZID=Asia/Shanghai:20990101T090000\nRRULE:FREQ=MINUTELY;INTERVAL=4"
+MORNING = "DTSTART;TZID=Asia/Shanghai:20990101T090000\nRRULE:FREQ=DAILY;INTERVAL=1;BYHOUR=9;BYMINUTE=0"
+EVENING = "DTSTART;TZID=Asia/Shanghai:20990101T090000\nRRULE:FREQ=DAILY;INTERVAL=1;BYHOUR=18;BYMINUTE=30"
 
 
 class FakeHost:
@@ -37,6 +40,7 @@ class FakeHost:
 
     def __init__(self) -> None:
         self.created: list[dict] = []
+        self.deleted: list[tuple[str, SessionOwner]] = []
         self.edited: list[dict] = []
         self.listed: list[dict] = []
         self.counted: list[str] = []
@@ -44,6 +48,7 @@ class FakeHost:
         self.mine_total = 1
         self.workspace_total = 3
         self.create_effect: BaseException | None = None
+        self.fail_create_after: int | None = None
         self.edit_effect: BaseException | None = None
         self.view_effect: BaseException | None = None
         self.current_target: dict = {"kind": "session", "sessionId": "c_chat"}
@@ -74,8 +79,14 @@ class FakeHost:
         self.created.append({"body": body, "owner": owner})
         if self.create_effect is not None:
             raise self.create_effect
+        # 第几条开始失败（批量建的中途出错）
+        if self.fail_create_after is not None and len(self.created) > self.fail_create_after:
+            raise KernelError("schedule_unavailable", "宿主写不进去了", 503)
         return self.an_entry(schedule_id="schedule-new", target=body["target"], title=body["title"],
                              prompt=body["prompt"], rrule=body["timing"]["rrule"])
+
+    async def delete_schedule(self, schedule_id, *, owner):
+        self.deleted.append((schedule_id, owner))
 
     async def edit_schedule(self, schedule_id, body, *, owner):
         self.edited.append({"id": schedule_id, "body": body, "owner": owner})
@@ -258,6 +269,49 @@ async def test_pending_execution_is_passed_through_as_409(world):
     assert response.json()["detail"] == {"code": "schedule_execution_pending",
                                          "message": "这个任务正在运行或排队，等它结束再试"}
 
+
+
+def batch(rules: list[str] | None = None, target: dict | None = None):
+    return {"title": "写日报", "prompt": "把今天的进展写下来",
+            "rules": rules if rules is not None else [MORNING, EVENING],
+            "target": target if target is not None else {"kind": "new_once"}}
+
+
+async def test_batch_creates_every_moment_with_one_request(world):
+    response = await world.call("post", f"{BASE}/batch", batch())
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert [item["id"] for item in body["items"]] == ["schedule-new", "schedule-new"]
+    # 每条规则各建一条任务，同一个执行位置（令牌只铸一次，也只建一次固定对话）
+    assert [sent["body"]["timing"]["rrule"] for sent in world.host.created] == [MORNING, EVENING]
+    assert {sent["body"]["target"]["kind"] for sent in world.host.created} == {"new_once"}
+    assert world.host.deleted == []
+
+
+async def test_batch_rolls_back_what_it_already_created(world):
+    world.host.fail_create_after = 1
+    response = await world.call("post", f"{BASE}/batch", batch())
+    assert response.status_code == 503, response.text
+    # 第二条失败：留下来的是半套，得把第一条删掉
+    assert len(world.host.created) == 2
+    assert world.host.deleted[0][0] == "schedule-new"
+
+
+async def test_batch_counts_the_whole_batch_against_the_quota(world):
+    # 已经有 19 条，一次再加 2 条就超过 20 —— 按一条判会漏过去
+    world.host.mine_total = 19
+    response = await world.call("post", f"{BASE}/batch", batch())
+    assert response.status_code == 422
+    assert response.json()["detail"] == {"code": "quota_exceeded",
+                                         "message": "每个人最多 20 条定时任务，先删掉不用的再建"}
+    assert world.host.created == []
+
+
+async def test_batch_with_one_too_dense_rule_creates_nothing(world):
+    response = await world.call("post", f"{BASE}/batch", batch([MORNING, MINUTES_4]))
+    assert response.status_code == 422
+    assert response.json()["detail"] == {"code": "interval_too_short", "message": "间隔不能小于 5 分钟"}
+    assert world.host.created == []
 
 async def test_target_session_must_be_my_own_conversation(world):
     response = await world.call("post", BASE, new_once({"kind": "session", "sessionId": "c_other"}))

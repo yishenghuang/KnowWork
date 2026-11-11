@@ -15,7 +15,7 @@
 """
 
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Annotated, Any, Literal, Protocol
 
 import httpx
@@ -27,8 +27,7 @@ from ..conversations.api import Actor, ActorDependency
 from ..conversations.service import Conversation, ConversationNotFound
 from ..conversations.summaries import SummaryQuery, SummaryRow
 from ..db.base import in_workspace
-from ..kernel.contract import KernelError, ScheduleNotFound, SessionOwner
-from ..kernel.host_client import HostKernel
+from ..kernel.contract import KernelError, ScheduleKernel, ScheduleNotFound, SessionOwner
 from ..sessionfiles.lookup import ConversationLookup
 from . import limits, tokens
 
@@ -44,12 +43,11 @@ HOST_ERRORS = (KernelError, httpx.HTTPError, OSError)
 
 # 到点时上一轮还没结束，这一次跳过的说明（前端原样显示在「最近一次」与投递记录里）
 SKIPPED_NOTE = "到点时上一轮还没结束，这一次跳过了"
-# 最近一次运行只看近 30 天的汇总：更早的记录对「最近一次跑成没跑成」没有意义，也免得多读
-RUN_WINDOW = timedelta(days=30)
-
-AUDIT_PAUSE_ACTION = "automation.auto_paused"
+# 最近一次运行看多久以内的汇总、自动暂停那条审计叫什么，都在 limits 里：supervisor 写、这里读，同一个值只写一次
+RUN_WINDOW = limits.RUN_WINDOW
+AUDIT_PAUSE_ACTION = limits.AUDIT_PAUSE_ACTION
 AUDIT_PAUSE_LIMIT = 200  # 与 AuditQuery.MAX_LIMIT 一致；一次批量读完，不为每条任务各查一次
-AUDIT_PAUSE_REASON = "连续 3 次运行失败，已自动暂停"
+AUDIT_PAUSE_REASON = limits.AUDIT_PAUSE_REASON
 
 
 def moment(value: Any) -> datetime | None:
@@ -164,12 +162,30 @@ class TargetBody(BaseModel):
                                   pattern=r"^[A-Za-z0-9_.:-]+$")
 
 
+# 一条 RRULE 行（带不带 DTSTART 都行，宿主都认）
+Rrule = Annotated[str, Field(min_length=1, max_length=2000)]
+
+
 class CreateBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     title: str = Field(min_length=1, max_length=120)
     prompt: str = Field(min_length=1, max_length=4000)
-    rrule: str = Field(min_length=1, max_length=2000)
+    rrule: Rrule
+    target: TargetBody
+
+
+class BatchCreateBody(BaseModel):
+    """一次建多条：每天多个时刻就是几条规则、同一句话，界面上仍是一条「新建」。
+
+    条数上限给 32：一天最多提醒这么多次已经不合常理，也免得一次请求把配额整段吃掉。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(min_length=1, max_length=120)
+    prompt: str = Field(min_length=1, max_length=4000)
+    rules: list[Rrule] = Field(min_length=1, max_length=32)
     target: TargetBody
 
 
@@ -191,10 +207,14 @@ class ConversationDirectory(ConversationLookup, Protocol):
                      conversation_id: str | None = None, readonly: bool = False) -> Conversation: ...
 
 
-# 保存前的本地拦截：这几条都是请求本身不合规，回 422 并把原因说清楚
-INTERVAL_TOO_SHORT = {"code": "interval_too_short", "message": "间隔不能小于 5 分钟"}
-PER_USER_QUOTA = {"code": "quota_exceeded", "message": "每个人最多 20 条定时任务，先删掉不用的再建"}
-PER_WORKSPACE_QUOTA = {"code": "quota_exceeded", "message": "每个空间最多 100 条定时任务，请联系管理员清理"}
+# 保存前的本地拦截：这几条都是请求本身不合规，回 422 并把原因说清楚。
+# 数值一律从 limits 里取（规格要求「这三个数值是常量，集中在一处」），文案里不再另写一份
+INTERVAL_TOO_SHORT = {"code": "interval_too_short",
+                      "message": f"间隔不能小于 {limits.MIN_INTERVAL_MINUTES} 分钟"}
+PER_USER_QUOTA = {"code": "quota_exceeded",
+                  "message": f"每个人最多 {limits.MAX_PER_USER} 条定时任务，先删掉不用的再建"}
+PER_WORKSPACE_QUOTA = {"code": "quota_exceeded",
+                       "message": f"每个空间最多 {limits.MAX_PER_WORKSPACE} 条定时任务，请联系管理员清理"}
 
 
 def rejected(detail: dict) -> HTTPException:
@@ -213,7 +233,7 @@ def write_error(error: Exception, action: str) -> HTTPException:
     return upstream_error(error, action)
 
 
-def build_router(kernel: HostKernel, current_actor: ActorDependency,
+def build_router(kernel: ScheduleKernel, current_actor: ActorDependency,
                  lookup: ConversationLookup | None = None, host_token: str | None = None,
                  runs: SummaryQuery | None = None, audit: AuditQuery | None = None) -> APIRouter:
     router = APIRouter(prefix="/api/workspaces/{workspace_id}/automations", tags=["automations"])
@@ -275,22 +295,39 @@ def build_router(kernel: HostKernel, current_actor: ActorDependency,
         await owned_conversation(target.sessionId, who)
         return {"kind": "session", "sessionId": target.sessionId}
 
-    async def guard_save(who: Actor, rrule: str) -> None:
-        """保存前先拦：间隔太密、本人太多、本空间太多。顺序固定，先说最贴近这条请求的那条。"""
+    async def guard_save(who: Actor, rrule: str, extra: int = 1) -> None:
+        """保存前先拦：间隔太密、本人太多、本空间太多。顺序固定，先说最贴近这条请求的那条。
+
+        extra 是这一次要建几条：一次建多个时刻时要按合计判，不能按一条判（不然 19 条时仍能一次加 5 条）。
+        """
         if limits.interval_too_short(rrule):
             raise rejected(INTERVAL_TOO_SHORT)
         try:
             mine = await kernel.list_schedules(owner=owner_of(who), limit=1)
         except HOST_ERRORS as error:
             raise upstream_error(error, "count my schedules") from error
-        if int(mine.get("total", 0)) >= limits.MAX_PER_USER:
+        if int(mine.get("total", 0)) + extra > limits.MAX_PER_USER:
             raise rejected(PER_USER_QUOTA)
         try:
             workspace = await kernel.count_schedules(workspace_id=who.workspace_id)
         except HOST_ERRORS as error:
             raise upstream_error(error, "count workspace schedules") from error
-        if int(workspace.get("total", 0)) >= limits.MAX_PER_WORKSPACE:
+        if int(workspace.get("total", 0)) + extra > limits.MAX_PER_WORKSPACE:
             raise rejected(PER_WORKSPACE_QUOTA)
+
+    async def discard(made: list[dict], who: Actor) -> None:
+        """一次建多条失败时，把已经建出来的删掉，尽量不留半套。
+
+        删不掉的只记日志：这时真正要报给用户的还是最初那个失败，不能让它被回滚的错盖过去。
+        """
+        for entry in made:
+            schedule_id = entry.get("id")
+            if not isinstance(schedule_id, str) or not schedule_id:
+                continue
+            try:
+                await kernel.delete_schedule(schedule_id, owner=owner_of(who))
+            except HOST_ERRORS:
+                log.warning("rollback created schedule %s failed", schedule_id, exc_info=True)
 
     async def current_entry(schedule_id: str, who: Actor) -> dict | None:
         """当前这条任务（历史里要不要补一条「跳过」、时间窗算到哪，都要看它）。读不到就当没有，不影响记录本身。"""
@@ -337,6 +374,8 @@ def build_router(kernel: HostKernel, current_actor: ActorDependency,
         """一次批量读「自动暂停」的原因：审计里按 id 留最新一条，只给这页里已暂停的任务。
 
         AuditQuery.page 自己 set_workspace，按 occurred_at desc / id desc 返回，所以每个 id 的第一条就是最新的。
+        只认 result="success" 那一类：任务被连续失败判定命中、但停用请求被宿主拒掉的那次（result="failed"）
+        不在这里显示成「已自动暂停」——它还跑着，界面不该说它停了。
         审计读不到或没登记查询对象都不能让列表读挂掉：返回空字典，前端退回普通「已暂停」文案。
         """
         if audit is None:
@@ -355,6 +394,9 @@ def build_router(kernel: HostKernel, current_actor: ActorDependency,
         for item in page.items:
             task_id = item.resource_id
             if not isinstance(task_id, str) or task_id not in wanted or task_id in result:
+                continue
+            # 老审计行可能没有 result 字段，按成功处理；只有明确是失败的那次跳过
+            if getattr(item, "result", "success") != "success":
                 continue
             detail = item.detail if isinstance(item.detail, dict) else {}
             reason = detail.get("reason")
@@ -442,6 +484,27 @@ def build_router(kernel: HostKernel, current_actor: ActorDependency,
             raise write_error(error, "create schedule") from error
         entry = await describe(created, who)
         return _written(entry)
+
+    @router.post("/batch", status_code=201)
+    async def create_automations(body: BatchCreateBody, who: Who):
+        """一次建多条（「每天 9:00 与 18:30」这种）：要么全成，要么一条都不留。
+
+        不能让前端逐条发：第 N 条失败时前面几条已经落在宿主里，用户看到报错回头重试就多出一批。
+        """
+        for rule in body.rules:
+            await guard_save(who, rule, len(body.rules))
+        target = await host_target(body.target, who)
+        made: list[dict] = []
+        try:
+            for rule in body.rules:
+                made.append(await kernel.create_schedule({
+                    "title": body.title, "prompt": body.prompt, "timing": {"kind": "rrule", "rrule": rule},
+                    "target": target,
+                }, owner=owner_of(who)))
+        except HOST_ERRORS as error:
+            await discard(made, who)
+            raise write_error(error, "create schedule") from error
+        return {"items": [_written(await describe(entry, who)) for entry in made]}
 
     @router.patch("/{schedule_id}")
     async def update_automation(schedule_id: ScheduleId, body: PatchBody, who: Who):

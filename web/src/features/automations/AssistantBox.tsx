@@ -8,7 +8,7 @@
 import { useState } from 'react';
 import { Button } from '@openai/apps-sdk-ui/components/Button';
 import { Textarea } from '@openai/apps-sdk-ui/components/Textarea';
-import { draftAutomation, type AutomationDraft } from '../../api/automations';
+import { draftAutomation, type AutomationDraft } from '../../api/automationDraft';
 import { readableError } from '../../api/http';
 import { Field } from '../../ui/Field';
 import { toast } from '../../ui/toastStore';

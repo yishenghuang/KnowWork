@@ -32,16 +32,17 @@ const task = (over: Record<string, unknown> = {}) => ({
 });
 
 /** 保存成功后业务服务只回这四样。 */
-const saved = (id = 'schedule-new') =>
-  jsonResponse(
-    {
-      id,
-      scheduledAt: '2026-11-13T01:00:00+00:00',
-      origin: 'page',
-      updatedAt: '2026-11-02T00:00:00+00:00',
-    },
-    201,
-  );
+const saved = (id = 'schedule-new') => ({ id, ...WRITTEN });
+
+const WRITTEN = {
+  scheduledAt: '2026-11-13T01:00:00+00:00',
+  origin: 'page',
+  updatedAt: '2026-11-02T00:00:00+00:00',
+} as const;
+
+/** 批量建任务回的是每一条的结果；一次配出两个时刻就有两条。 */
+const batchSaved = (count = 1) =>
+  jsonResponse({ items: Array.from({ length: count }, (_, i) => saved(`schedule-new-${i}`)) }, 201);
 
 function setup(items: readonly unknown[] = [], extra: Record<string, unknown> = {}) {
   const fetch = routeFetch({
@@ -76,7 +77,7 @@ async function save(form: HTMLElement) {
 
 /** 取 rrule 的第二行（RRULE 那一行）：DTSTART 里可能带「现在」，那一段不参与断言。 */
 const ruleLine = (body: unknown) => {
-  const rrule = (body as { rrule: string }).rrule;
+  const rrule = (body as { rules: readonly string[] }).rules[0] as string;
   return rrule.split('\n').at(-1);
 };
 
@@ -143,19 +144,19 @@ describe('新建任务', () => {
     const fetch = routeFetch({
       'GET /api/auth/me': jsonResponse(ME),
       [`GET ${B}/automations`]: () => jsonResponse({ items, total: items.length, limit: 100, offset: 0 }),
-      [`POST ${B}/automations`]: (call) => {
-        const body = call.body as { title: string; prompt: string; rrule: string };
+      [`POST ${B}/automations/batch`]: (call) => {
+        const body = call.body as { title: string; prompt: string; rules: readonly string[] };
         items.push(
           task({
             id: 'schedule-new',
             title: body.title,
             prompt: body.prompt,
-            rrule: body.rrule,
+            rrule: body.rules[0],
             target: { kind: 'new_once' },
             targetSessionId: null,
           }),
         );
-        return saved() as Response;
+        return batchSaved() as Response;
       },
     });
     renderWithApp(<AutomationsPage />, { route: '/automations' });
@@ -168,7 +169,7 @@ describe('新建任务', () => {
     expect(await screen.findByText('每天九点写日报')).toBeInTheDocument();
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
 
-    const posts = fetch.find('POST', `${B}/automations`);
+    const posts = fetch.find('POST', `${B}/automations/batch`);
     expect(posts).toHaveLength(1);
     const body = posts[0]!.body as { target: unknown; title: string };
     expect(body.title).toBe('每天九点写日报');
@@ -176,14 +177,14 @@ describe('新建任务', () => {
   });
 
   it('选「固定对话」时把执行位置一起存下去', async () => {
-    const fetch = setup([], { [`POST ${B}/automations`]: saved() });
+    const fetch = setup([], { [`POST ${B}/automations/batch`]: batchSaved() });
     const form = await openCreate();
     fill(form);
     await userEvent.click(within(form).getByRole('radio', { name: '固定对话' }));
     await save(form);
 
     const posts = await waitFor(() => {
-      const found = fetch.find('POST', `${B}/automations`);
+      const found = fetch.find('POST', `${B}/automations/batch`);
       expect(found).toHaveLength(1);
       return found;
     });
@@ -191,7 +192,7 @@ describe('新建任务', () => {
   });
 
   it('「每天 09:00, 18:30」一次保存建出两条任务', async () => {
-    const fetch = setup([], { [`POST ${B}/automations`]: saved() });
+    const fetch = setup([], { [`POST ${B}/automations/batch`]: batchSaved(2) });
     const form = await openCreate();
     fill(form);
     fireEvent.change(within(form).getByLabelText('时刻'), {
@@ -199,12 +200,14 @@ describe('新建任务', () => {
     });
     await save(form);
 
+    // 两个时刻是同一次保存里交上去的：一次请求，两条规则
     const posts = await waitFor(() => {
-      const found = fetch.find('POST', `${B}/automations`);
-      expect(found).toHaveLength(2);
+      const found = fetch.find('POST', `${B}/automations/batch`);
+      expect(found).toHaveLength(1);
       return found;
     });
-    expect(posts.map((call) => ruleLine(call.body))).toEqual([
+    const rules = (posts[0]!.body as { rules: readonly string[] }).rules;
+    expect(rules.map((one) => one.split('\n').at(-1))).toEqual([
       'RRULE:FREQ=DAILY;INTERVAL=1;BYHOUR=9;BYMINUTE=0',
       'RRULE:FREQ=DAILY;INTERVAL=1;BYHOUR=18;BYMINUTE=30',
     ]);
@@ -212,7 +215,7 @@ describe('新建任务', () => {
 
   for (const one of CASES) {
     it(`「${one.label}」存成 ${one.rrule}`, async () => {
-      const fetch = setup([], { [`POST ${B}/automations`]: saved() });
+      const fetch = setup([], { [`POST ${B}/automations/batch`]: batchSaved() });
       const form = await openCreate();
       fill(form);
       await pickOption(form, '时间规则', one.option);
@@ -220,12 +223,12 @@ describe('新建任务', () => {
       await save(form);
 
       const posts = await waitFor(() => {
-        const found = fetch.find('POST', `${B}/automations`);
+        const found = fetch.find('POST', `${B}/automations/batch`);
         expect(found).toHaveLength(1);
         return found;
       });
       expect(ruleLine(posts[0]!.body)).toBe(one.rrule);
-      const rrule = (posts[0]!.body as { rrule: string }).rrule;
+      const rrule = (posts[0]!.body as { rules: readonly string[] }).rules[0] as string;
       // 时区照浏览器那一个写进 DTSTART；自定义那条以用户自己写的为准
       if (one.option !== '自定义') expect(rrule.startsWith(`DTSTART;TZID=${TZ}:`)).toBe(true);
     });
@@ -233,7 +236,7 @@ describe('新建任务', () => {
 
   it('别人刚改过时提示刷新，不静默覆盖', async () => {
     setup([], {
-      [`POST ${B}/automations`]: jsonResponse(
+      [`POST ${B}/automations/batch`]: jsonResponse(
         { detail: { code: 'schedule_conflict', message: '任务刚被改过，请刷新后再改' } },
         409,
       ),
@@ -249,7 +252,7 @@ describe('新建任务', () => {
 
   it('间隔少于 5 分钟时在时间规则上说明原因', async () => {
     setup([], {
-      [`POST ${B}/automations`]: jsonResponse(
+      [`POST ${B}/automations/batch`]: jsonResponse(
         { detail: { code: 'interval_too_short', message: '间隔不能小于 5 分钟' } },
         422,
       ),
@@ -265,7 +268,7 @@ describe('新建任务', () => {
 
   it('条数到上限时把原因说在表单上', async () => {
     setup([], {
-      [`POST ${B}/automations`]: jsonResponse(
+      [`POST ${B}/automations/batch`]: jsonResponse(
         {
           detail: {
             code: 'quota_exceeded',

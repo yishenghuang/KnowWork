@@ -14,16 +14,16 @@
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from typing import Annotated
+from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from ..access.api import ProfileLookup
 from ..access.service import AccessService
 from ..access.vocab import WORKSPACE_RESOURCE, Action
 from ..auth.principal import Principal
 from ..conversations.summaries import SummaryQuery, SummaryRow
-from ..kernel.host_client import HostKernel
+from ..kernel.contract import ScheduleKernel
 from ..sessionfiles.lookup import ConversationLookup
 from .api import HOST_ERRORS, ScheduleId, last_run, latest_runs, origin_of, upstream_error, write_error
 
@@ -32,6 +32,9 @@ log = logging.getLogger(__name__)
 # 宿主单页最多 500 条（MAX_LIST_LIMIT）。一次翻二十页：真到这一步说明任务上万条了，宁可少读也不无限翻
 PAGE_SIZE = 500
 MAX_PAGES = 20
+
+# 状态筛选与「我的定时任务」用同一组分档（宿主 status 字段的三个取值）
+StatusFilter = Literal["active", "paused", "ended"]
 
 FORBIDDEN = "只有空间的所有者或管理员可以查看本空间的定时任务"
 ACCESS_UNAVAILABLE = "权限服务暂时不可用，请稍后重试"
@@ -55,7 +58,7 @@ def owner_user(entry: dict) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def build_router(kernel: HostKernel, access: AccessService,
+def build_router(kernel: ScheduleKernel, access: AccessService,
                  current_principal: Callable[..., Awaitable[Principal]],
                  lookup: ConversationLookup | None = None,
                  runs: SummaryQuery | None = None, profiles: ProfileLookup | None = None) -> APIRouter:
@@ -69,10 +72,15 @@ def build_router(kernel: HostKernel, access: AccessService,
         if not access.check(who.user_id, workspace_id, WORKSPACE_RESOURCE, Action.EDIT):
             raise HTTPException(status_code=403, detail=FORBIDDEN)
 
-    async def catalog() -> list[dict]:
-        """宿主里的全部任务，不按调用者过滤。多翻几页：别的空间的任务可能把本空间的挤出第一页。"""
+    async def catalog() -> tuple[list[dict], bool]:
+        """宿主里的全部任务，不按调用者过滤。多翻几页：别的空间的任务可能把本空间的挤出第一页。
+
+        第二个返回值说明「还有没读完的」：翻满二十页仍没到底时不再往下翻，但也不能假装列表是完整的
+        （AC1 要的是本空间全部任务）。调用方把它如实带给前端，由界面说明这一次只列出了前一部分。
+        """
         found: list[dict] = []
         offset = 0
+        truncated = False
         for _ in range(MAX_PAGES):
             page = await kernel.list_schedules(owner=None, limit=PAGE_SIZE, offset=offset)
             batch = [entry for entry in page.get("items", []) if isinstance(entry, dict)]
@@ -80,8 +88,10 @@ def build_router(kernel: HostKernel, access: AccessService,
             total = page.get("total")
             offset += len(batch)
             if not batch or not isinstance(total, int) or offset >= total:
+                truncated = False  # 这一次读到到底了
                 break
-        return found
+            truncated = True  # 后面还有，接着读；读满页数仍没到底就是上面那个 True
+        return found, truncated
 
     async def creator_names(entries: list[dict]) -> dict[str, str]:
         """一次把创建者姓名取回来。查不到（账号注销、资料服务出错）就留空，列表照常显示，不因为名字读不出发 503。"""
@@ -106,21 +116,29 @@ def build_router(kernel: HostKernel, access: AccessService,
                 "lastRun": last_run(entry, run, now)}
 
     @router.get("")
-    async def list_all_automations(workspace_id: str, who: Who):
-        """本空间全部定时任务（含已暂停的）。只读：管理员在这里看，不在这里建。"""
+    async def list_all_automations(workspace_id: str, who: Who,
+                                   creator: Annotated[str | None, Query(max_length=128)] = None,
+                                   status: StatusFilter | None = None):
+        """本空间全部定时任务（含已暂停的）。只读：管理员在这里看，不在这里建。
+
+        creator 与 status 在这里就筛掉（票 #9 的 AC2）：任务上万条时把整表交给前端过滤，翻页与总数都会失真。
+        """
         require_admin(who, workspace_id)
         try:
-            found = await catalog()
+            found, truncated = await catalog()
         except HOST_ERRORS as error:
             raise upstream_error(error, "list workspace schedules") from error
-        entries = [entry for entry in found if owner_workspace(entry) == workspace_id]
+        entries = [entry for entry in found
+                   if owner_workspace(entry) == workspace_id
+                   and (creator is None or owner_user(entry) == creator)
+                   and (status is None or entry.get("status") == status)]
         now = datetime.now(UTC)
         latest = await latest_runs(runs, workspace_id, entries, now)
         names = await creator_names(entries)
         items = [await describe(entry, workspace_id, latest.get(str(entry.get("id"))), now,
                                 names.get(owner_user(entry) or ""))
                  for entry in entries]
-        return {"items": items, "total": len(items)}
+        return {"items": items, "total": len(items), "truncated": truncated}
 
     @router.post("/{schedule_id}/disable")
     async def disable_automation(schedule_id: ScheduleId, workspace_id: str, who: Who):

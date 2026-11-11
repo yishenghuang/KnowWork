@@ -9,14 +9,12 @@
  * 管理端只有两件事：看、停用。不替别人新建，也不改任务内容（AC5）：改内容仍由创建者自己在自动化页里做，
  * 停用之后创建者也能在自己那边恢复。所以这一页没有任何新建/编辑入口，只有状态为「运行中」的行才有「停用」。
  */
-import { useMemo, useState } from 'react';
+import { useState } from 'react';
 import { Button } from '@openai/apps-sdk-ui/components/Button';
 import { Warning } from '@openai/apps-sdk-ui/components/Icon';
-import { useQuery } from '@tanstack/react-query';
 import { Link } from 'react-router';
 import {
   disableAdminAutomation,
-  listAdminAutomations,
   type AdminAutomation,
   type LastRun as LastRunInfo,
 } from '../../../api/automations';
@@ -30,8 +28,7 @@ import { formatDateTime } from '../../../utils/format';
 import { RUN_STATUS_TEXT, scheduleText, STATUS_TEXT } from '../../automations/model';
 import { AdminPage, Toolbar } from '../AdminPage';
 import { useAction } from '../useAction';
-
-const KEYS = { list: ['admin', 'automations'] } as const;
+import { ADMIN_AUTOMATION_KEY, useAdminAutomations, useAdminCreatorOptions } from './queries';
 
 type StatusFilter = 'active' | 'paused' | 'ended';
 
@@ -77,34 +74,20 @@ const COLUMNS: readonly Column<AdminAutomation>[] = [
 export default function AutomationsPage() {
   const [creator, setCreator] = useState<string | undefined>(undefined);
   const [status, setStatus] = useState<StatusFilter | undefined>(undefined);
-  const automations = useQuery({ queryKey: KEYS.list, queryFn: listAdminAutomations });
+  // 筛选交给服务端：换了筛选项就是换一个查询（queryKey 里带着筛选项）
+  const automations = useAdminAutomations({ creator, status });
+  const creators = useAdminCreatorOptions();
   const disable = useAction((id: string) => disableAdminAutomation(id), {
-    invalidate: [KEYS.list],
+    invalidate: [ADMIN_AUTOMATION_KEY],
     success: '已停用，到点不会再触发',
     failure: '停用没有成功，请稍后重试',
   });
 
-  const all = useMemo(() => automations.data?.items ?? [], [automations.data]);
-
-  // 创建者选项跟着列表走：只列本空间里真有任务的人，不另外拉一遍成员表
-  const creatorOptions = useMemo(() => {
-    const seen = new Map<string, string>();
-    for (const task of all) {
-      if (!task.creatorId) continue;
-      if (!seen.has(task.creatorId)) seen.set(task.creatorId, task.creatorName ?? task.creatorId);
-    }
-    return [...seen].map(([value, label]) => ({ value, label }));
-  }, [all]);
-
-  // 选中的创建者已经不在列表里了（任务被删光）就当「全部」：不然筛选看起来永远空着
-  const activeCreator =
-    creator !== undefined && creatorOptions.some((option) => option.value === creator) ? creator : undefined;
-
-  const rows = all.filter(
-    (task) =>
-      (activeCreator === undefined || task.creatorId === activeCreator) &&
-      (status === undefined || task.status === status),
-  );
+  const rows = automations.data?.items ?? [];
+  const creatorOptions = creators.data ?? [];
+  const filtered = creator !== undefined || status !== undefined;
+  // 任务多到翻不完时如实说明：不能让人以为本空间就这几条
+  const truncated = automations.data?.truncated ?? false;
 
   const askDisable = async (task: AdminAutomation) => {
     const ok = await confirm({
@@ -171,7 +154,7 @@ export default function AutomationsPage() {
               clearable
               width={160}
               options={creatorOptions}
-              value={activeCreator}
+              value={creator}
               onChange={setCreator}
             />
             <FilterSelect
@@ -195,7 +178,8 @@ export default function AutomationsPage() {
           minWidth={1120}
           loading={automations.isFetching}
           pageSize={false}
-          empty={all.length === 0 ? '这个空间还没有定时任务' : '没有符合条件的任务'}
+          empty={filtered ? '没有符合条件的任务' : '这个空间还没有定时任务'}
+          summary={truncated ? '任务太多，这一次只列出了前一部分；用创建者或状态筛选后再看' : undefined}
           aria-label="本空间的定时任务"
         />
       )}

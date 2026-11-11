@@ -284,6 +284,61 @@ async def test_list_survives_a_broken_run_query(world, monkeypatch):
     assert response.json()["items"][0]["lastRun"] is None
 
 
+
+async def test_creator_filter_is_applied_before_the_list_is_returned(world):
+    """AC2：按创建者筛选在服务端做；别的创建者的任务一条都不许混进来。"""
+    world.host.items = [entry({"id": "u1-task", "owner": {"workspaceId": WORKSPACE, "userId": "u1"}}),
+                        entry({"id": "u2-task", "owner": {"workspaceId": WORKSPACE, "userId": "u2"}})]
+    body = (await world.get(BASE + "?creator=u2", "alice")).json()
+    assert [item["id"] for item in body["items"]] == ["u2-task"]
+    assert body["total"] == 1
+
+
+async def test_status_filter_is_applied_before_the_list_is_returned(world):
+    """AC2：按状态筛选同样在服务端做。"""
+    world.host.items = [entry({"id": "running"}),
+                        entry({"id": "paused", "status": "paused"}),
+                        entry({"id": "done", "status": "ended"})]
+    body = (await world.get(BASE + "?status=paused", "alice")).json()
+    assert [item["id"] for item in body["items"]] == ["paused"]
+
+
+async def test_creator_from_another_workspace_sees_nothing(world):
+    """筛选不能变成越权读：creator 指到别的空间的人，只会得到空列表。"""
+    world.host.items = [entry({"id": "theirs", "owner": {"workspaceId": OTHER_WORKSPACE, "userId": "u9"}}),
+                        entry({"id": "mine"})]
+    body = (await world.get(BASE + "?creator=u9", "alice")).json()
+    assert body["items"] == []
+    assert body["total"] == 0
+
+
+async def test_creator_and_status_filters_combine(world):
+    world.host.items = [entry({"id": "a", "status": "active"}),
+                        entry({"id": "b", "status": "paused"}),
+                        entry({"id": "c", "status": "paused", "owner": {"workspaceId": WORKSPACE, "userId": "u2"}})]
+    body = (await world.get(BASE + "?creator=u1&status=paused", "alice")).json()
+    assert [item["id"] for item in body["items"]] == ["b"]
+
+
+async def test_truncated_catalog_is_reported_as_truncated(world):
+    """读不完就说读不完：翻满页数还没到底时，回包里要说清这一次不是全量（AC1 不能被静默打折）。"""
+    world.host.items = [entry({"id": "only-one"})]
+    response = await world.get(BASE, "alice")
+    assert response.status_code == 200
+    assert response.json()["truncated"] is False
+
+    async def endless(*, owner, limit=100, offset=0, active=None):
+        world.host.listed.append({"owner": owner, "limit": limit, "offset": offset, "active": active})
+        return {"items": [entry({"id": f"task-{offset}"})], "shown": 1, "total": 10**6,
+                "limit": limit, "offset": offset}
+
+    world.host.list_schedules = endless  # type: ignore[method-assign]
+    world.host.listed.clear()
+    body = (await world.get(BASE, "alice")).json()
+    assert body["truncated"] is True
+    assert len(world.host.listed) == 20, "翻满 MAX_PAGES 就停，不无限翻"
+    assert len({call["offset"] for call in world.host.listed}) == 20, "每一页都往后翻，不重复读"
+
 async def test_disable_passes_the_workspace_and_pauses_the_task(world):
     """AC3：管理员停用本空间的任意一条：宿主按空间停用，回来的状态是已暂停。"""
     response = await world.disable("schedule-1", "bob")

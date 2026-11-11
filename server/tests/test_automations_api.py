@@ -225,9 +225,9 @@ class FakeAuditQuery:
         return SimpleNamespace(items=self.items)
 
 
-def audit_row(task_id, reason, at, *, detail=None):
-    """审计行的替身：读侧只用 resource_id / detail / occurred_at。"""
-    return SimpleNamespace(resource_id=task_id,
+def audit_row(task_id, reason, at, *, detail=None, result="success"):
+    """审计行的替身：读侧只用 resource_id / result / detail / occurred_at。"""
+    return SimpleNamespace(resource_id=task_id, result=result,
                            detail={"reason": reason} if detail is None else detail,
                            occurred_at=at)
 
@@ -273,6 +273,20 @@ async def test_auto_pause_reason_on_single_task(world):
     async with with_audit(world, audit) as http:
         body = (await http.get(f"{BASE}/schedule-1", headers={"Authorization": f"Bearer {TOKEN}"})).json()
     assert body["autoPaused"] == {"reason": "连续失败", "at": "2026-11-11T10:00:00Z"}
+
+
+async def test_failed_auto_pause_audit_is_not_reported_as_paused(world):
+    """「该自动暂停但停用请求被拒」留的是 result=failed：任务还在跑，不能显示成「已自动暂停」。"""
+    world.host.items = [entry({"id": "paused-1", "status": "paused"})]
+    at = datetime(2026, 11, 11, 10, 0, tzinfo=UTC)
+    audit = FakeAuditQuery([
+        audit_row("paused-1", "没停成", at, result="failed",
+                  detail={"reason": "没停成", "error": "forbidden"}),
+        audit_row("paused-1", "更早那次停成了", datetime(2026, 11, 10, 10, 0, tzinfo=UTC)),
+    ])
+    async with with_audit(world, audit) as http:
+        body = (await http.get(BASE, headers={"Authorization": f"Bearer {TOKEN}"})).json()
+    assert body["items"][0]["autoPaused"] == {"reason": "更早那次停成了", "at": "2026-11-10T10:00:00Z"}
 
 
 async def test_no_audit_query_or_failed_read_never_breaks_the_list(world):

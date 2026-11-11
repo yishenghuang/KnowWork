@@ -2,8 +2,8 @@
  * 新建 / 编辑一条定时任务的表单。
  *
  * 「时间规则」按八种预设填，落库前统一由 model.buildRules 变成 rrule：拿到的是规则数组，
- * 每天多个时刻就是几条规则——新建时一条规则发一个请求（一次配出 9:00 与 18:30 就是两条任务）；
- * 编辑改的是列表里那一行，所以编辑只认第一条（多出来的会明确提示另建）。
+ * 每天多个时刻就是几条规则——新建时一次请求全交上去（一次配出 9:00 与 18:30 就是两条任务，
+ * 要么一起建出来，要么一条都不留）；编辑改的是列表里那一行，所以编辑只认第一条（多出来的会明确提示另建）。
  * 时区用浏览器的 IANA 名写进 DTSTART;TZID=，不换成 UTC：写 9:00 就是当地 9:00 跑。
  */
 import { useMemo, useState } from 'react';
@@ -14,13 +14,13 @@ import { Select } from '@openai/apps-sdk-ui/components/Select';
 import { Textarea } from '@openai/apps-sdk-ui/components/Textarea';
 import { useQueryClient } from '@tanstack/react-query';
 import {
-  createAutomation,
+  createAutomations,
   updateAutomation,
   type Automation,
-  type AutomationDraft,
   type AutomationPatch,
   type AutomationTarget,
 } from '../../api/automations';
+import type { AutomationDraft } from '../../api/automationDraft';
 import { browserTimeZone } from '../../api/conversations';
 import { ApiError, readableError } from '../../api/http';
 import { Dialog, DialogActions } from '../../ui/Dialog';
@@ -29,7 +29,7 @@ import { rule, useForm } from '../../ui/form';
 import { NumberInput } from '../../ui/NumberInput';
 import { toast } from '../../ui/toastStore';
 import AssistantBox from './AssistantBox';
-import { buildRules, describeRule, parseRule, type Preset, type Weekday } from './model';
+import { buildRules, describeRule, MIN_INTERVAL_MINUTES, parseRule, type Preset, type Weekday } from './model';
 import { AUTOMATION_KEYS } from './queries';
 
 /** 表单里正在编辑的那份预设：参数先按输入框原样留着，落库前才校验、才规整。 */
@@ -310,14 +310,13 @@ export function AutomationForm({
         };
         await updateAutomation(task.id, patch);
       } else {
-        for (const one of rules) {
-          await createAutomation({
-            title: values.title.trim(),
-            prompt: values.prompt.trim(),
-            rrule: one,
-            target,
-          });
-        }
+        // 一次提交就是一次请求：每天 9:00 与 18:30 要么一起建出来，要么一条都不留（服务端会回滚）
+        await createAutomations({
+          title: values.title.trim(),
+          prompt: values.prompt.trim(),
+          rules,
+          target,
+        });
       }
       await queryClient.invalidateQueries({ queryKey: AUTOMATION_KEYS.list });
       toast.success(editing ? '改好了' : '任务已建好');
@@ -443,12 +442,15 @@ function DraftFields({
     case 'minutes':
     case 'hours':
       return (
-        <Field label="间隔" help={draft.kind === 'minutes' ? '最少 5 分钟一次。' : '每几小时一次。'}>
+        <Field
+          label="间隔"
+          help={draft.kind === 'minutes' ? `最少 ${MIN_INTERVAL_MINUTES} 分钟一次。` : '每几小时一次。'}
+        >
           {(id) => (
             <NumberInput
               id={id}
               className="kw-input-narrow"
-              min={draft.kind === 'minutes' ? 5 : 1}
+              min={draft.kind === 'minutes' ? MIN_INTERVAL_MINUTES : 1}
               max={999}
               value={draft.every}
               onChange={(every) => onChange({ ...draft, every })}

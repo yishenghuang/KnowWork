@@ -44,10 +44,22 @@ const task = (over: Record<string, unknown> = {}) => ({
   ...over,
 });
 
-function api(items: readonly unknown[], extra: Record<string, unknown> = {}) {
+/** 按 query 里给的筛选条件筛一遍，模拟服务端（筛选不在前端做，测试也不该在前端假筛）。 */
+function page(items: readonly Record<string, unknown>[], query: URLSearchParams) {
+  const creator = query.get('creator');
+  const status = query.get('status');
+  const rows = items.filter(
+    (item) =>
+      (creator === null || (item.owner as { userId?: string } | undefined)?.userId === creator) &&
+      (status === null || item.status === status),
+  );
+  return { items: rows, total: rows.length, truncated: false };
+}
+
+function api(items: readonly Record<string, unknown>[], extra: Record<string, unknown> = {}) {
   return routeFetch({
     'GET /api/auth/me': jsonResponse(ME),
-    [`GET ${B}/automations/admin`]: jsonResponse({ items, total: items.length }),
+    [`GET ${B}/automations/admin`]: (call) => jsonResponse(page(items, call.query)),
     ...extra,
   });
 }
@@ -90,8 +102,8 @@ describe('管理端自动化审计', () => {
     expect(within(await rowOf('每日站会提醒')).getByText('u9')).toBeInTheDocument();
   });
 
-  it('按创建者筛选，只留这个人建的', async () => {
-    api([
+  it('按创建者筛选：把创建者交给服务端筛，不是把整表拉下来自己过滤', async () => {
+    const fetch = api([
       task({ id: 'schedule-a', title: '每日站会提醒' }),
       task({
         id: 'schedule-b',
@@ -106,10 +118,13 @@ describe('管理端自动化审计', () => {
     await pickOption(document.body, '创建者', '张三');
     await waitFor(() => expect(screen.queryByText('周报汇总')).not.toBeInTheDocument());
     expect(screen.getByText('每日站会提醒')).toBeInTheDocument();
+    // 换了筛选就是换一个查询：服务端收到 creator，前端不自己藏行
+    const calls = fetch.find('GET', `${B}/automations/admin`);
+    expect(calls.at(-1)?.query.get('creator')).toBe('u1');
   });
 
-  it('按状态筛选，只留这一种状态', async () => {
-    api([
+  it('按状态筛选：同样交给服务端', async () => {
+    const fetch = api([
       task({ id: 'schedule-a', title: '每日站会提醒' }),
       task({ id: 'schedule-b', title: '周报汇总', status: 'paused' }),
     ]);
@@ -119,6 +134,21 @@ describe('管理端自动化审计', () => {
     await pickOption(document.body, '状态', '已暂停');
     await waitFor(() => expect(screen.queryByText('每日站会提醒')).not.toBeInTheDocument());
     expect(screen.getByText('周报汇总')).toBeInTheDocument();
+    expect(fetch.find('GET', `${B}/automations/admin`).at(-1)?.query.get('status')).toBe('paused');
+  });
+
+  it('任务多到翻不完时说清只列了一部分', async () => {
+    routeFetch({
+      'GET /api/auth/me': jsonResponse(ME),
+      [`GET ${B}/automations/admin`]: jsonResponse({
+        items: [task()],
+        total: 1,
+        truncated: true,
+      }),
+    });
+    renderWithApp(<AutomationsPage />, { route: '/admin/automations' });
+    await rowOf('每日站会提醒');
+    expect(screen.getByText(/只列出了前一部分/)).toBeInTheDocument();
   });
 
   it('停用：先确认，确认后发 POST .../disable 并重新拉列表', async () => {

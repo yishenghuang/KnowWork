@@ -2,7 +2,7 @@
 
 用轻量 Fake 顶掉真库 / 宿主 HTTP / 审计落库，不碰共享夹具，也不起 RLS 会话。
 重点验证：只有「本轮 failed + 历史两条都 failed」才暂停；中间成功 / 取消清零；
-user_id 为空、状态非 failed、跳过（无汇总行）直接放过；宿主写失败只吞掉、不写审计。
+user_id 为空、状态非 failed、跳过（无汇总行）直接放过；宿主写失败只吞掉、但要留一条 result="failed" 的审计。
 """
 
 from datetime import UTC, datetime, timedelta
@@ -149,14 +149,21 @@ async def test_no_user_id_returns_without_touching_the_kernel():
     assert sink.events == []
 
 
-@pytest.mark.parametrize("error", [KernelError("host_down", "host unavailable", 502),
-                                   httpx.ConnectError("no route to host")])
-async def test_host_failure_is_swallowed_and_never_audits(error):
-    """只有 edit 成功才留痕；宿主不可达只记日志、绝不向 _facts 抛。"""
+@pytest.mark.parametrize("error,code", [
+    (KernelError("host_down", "host unavailable", 502), "host_down"),
+    (httpx.ConnectError("no route to host"), "ConnectError"),
+])
+async def test_host_failure_is_swallowed_but_audited_as_failed(error, code):
+    """暂停没停成也要留痕：result=failed 且带上宿主的错误码，绝不向 _facts 抛。"""
     sup, _runs, kernel, sink = make([row("failed"), row("failed")], kernel_error=error)
     assert await sup.observe(ended()) is None
     assert len(kernel.calls) == 1
-    assert sink.events == []
+    [event] = sink.events
+    assert event.action == "automation.auto_paused"
+    assert event.result == "failed"
+    assert event.resource_id == TASK_ID
+    assert event.detail == {"reason": PAUSE_REASON, "failures": 3, "scheduleId": TASK_ID,
+                            "conversationId": "conv-1", "error": code}
 
 
 async def test_empty_schedule_returns_immediately():
