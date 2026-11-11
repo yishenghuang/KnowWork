@@ -11,6 +11,12 @@
  */
 import type { RunStatus } from '../../api/automations';
 
+/**
+ * 两次运行至少要隔几分钟。与服务端 automations/limits.py 的 MIN_INTERVAL_SECONDS 是同一个数
+ * （那边是护栏的唯一来源，这里是表单上的输入下限与提示文案，别各写一份）。
+ */
+export const MIN_INTERVAL_MINUTES = 5;
+
 /** ISO 星期，和 RRULE 的 BYDAY 同序（周一在前）。 */
 export const WEEKDAYS = ['MO', 'TU', 'WE', 'TH', 'FR', 'SA', 'SU'] as const;
 

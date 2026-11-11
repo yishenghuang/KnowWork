@@ -137,7 +137,7 @@ function segmentOf(raw) {
  * @returns {import('./multi-user/caller.mjs').Owner | undefined}
  */
 function callerOwnerOf(headers) {
-  const field = (name, header) => {
+  const field = (header) => {
     const value = headers[header]
     if (value === undefined) return undefined
     if (typeof value !== 'string' || value.length === 0 || value.length > 128) {
@@ -145,8 +145,8 @@ function callerOwnerOf(headers) {
     }
     return value
   }
-  const workspaceId = field('workspaceId', OWNER_WORKSPACE_HEADER)
-  const userId = field('userId', OWNER_USER_HEADER)
+  const workspaceId = field(OWNER_WORKSPACE_HEADER)
+  const userId = field(OWNER_USER_HEADER)
   if (workspaceId === undefined && userId === undefined) return undefined
   if (workspaceId === undefined || userId === undefined) throw new HttpError(400, 'invalid_request', '调用者身份不完整')
   return { workspaceId, userId }

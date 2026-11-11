@@ -55,7 +55,7 @@ export function ownerOfToken(token, hostToken) {
   return ownerOf(parts[1])
 }
 
-/** 铸一枚令牌（业务服务侧用同一算法；宿主侧自己只在测试与本地调式时用得到）。 */
+/** 铸一枚令牌（业务服务侧用同一算法；宿主侧自己只在测试与本地调试时用得到）。 */
 export function mintToken(owner, hostToken) {
   const payload = Buffer.from(JSON.stringify({ w: owner.workspaceId, u: owner.userId }), 'utf8').toString('base64url')
   const signed = `${PREFIX}.${payload}`
