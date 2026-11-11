@@ -65,6 +65,8 @@ export interface Automation {
   readonly lastRun: LastRun | null;
   readonly createdAt: string | null;
   readonly updatedAt: string | null;
+  /** 宿主说这一轮正在跑或排队（runSchedule 后立即为 true）：「立即运行」按钮这时不能点。 */
+  readonly executionActive: boolean;
 }
 
 export interface AutomationPage {
@@ -164,6 +166,7 @@ export function parseAutomation(value: unknown): Automation | undefined {
     lastRun: parseLastRun(value.lastRun),
     createdAt: text(value.createdAt) ?? null,
     updatedAt: text(value.updatedAt) ?? null,
+    executionActive: value.executionActive === true,
   };
 }
 
@@ -236,4 +239,24 @@ export async function automationHistory(
     nextBefore: text(body.nextBefore) ?? null,
     earlierRecordsUnavailable: bool(body.earlierRecordsUnavailable),
   };
+}
+
+/** 暂停：到点不再触发。走业务服务的薄路由，宿主的官方写侧把 active 关掉。 */
+export async function pauseAutomation(id: string): Promise<void> {
+  await request<unknown>(base(`/${seg(id)}/pause`), { method: 'POST' });
+}
+
+/** 恢复：宿主按 patch.active=true 重算下一次运行时间，原来的规则不动。 */
+export async function resumeAutomation(id: string): Promise<void> {
+  await request<unknown>(base(`/${seg(id)}/resume`), { method: 'POST' });
+}
+
+/** 立即运行一次：宿主立刻发起一轮、原来的下次运行时间不变；正在跑/排队时回 409。 */
+export async function runAutomation(id: string): Promise<void> {
+  await request<unknown>(base(`/${seg(id)}/run`), { method: 'POST' });
+}
+
+/** 删除：宿主侧不再触发；它跑过的对话与消息不在这里，删不掉。 */
+export async function deleteAutomation(id: string): Promise<void> {
+  await request<unknown>(base(`/${seg(id)}`), { method: 'DELETE' });
 }

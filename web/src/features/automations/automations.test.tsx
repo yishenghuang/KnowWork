@@ -8,10 +8,16 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { screen, within } from '@testing-library/react';
 import userEvent from '../../test/user';
 import { jsonResponse, ME, renderWithApp, routeFetch } from '../../test/render';
+import { useConfirmState } from '../../ui/confirmStore';
+import { useToasts } from '../../ui/toastStore';
 import AutomationsPage from './AutomationsPage';
 import { buildRules, describeRule, type Preset } from './model';
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  useToasts.getState().clear();
+  useConfirmState.setState({ pending: null });
+});
 
 const B = '/api/workspaces/default';
 const TZ = 'Asia/Shanghai';
@@ -40,6 +46,15 @@ function api(items: readonly unknown[], extra: Record<string, unknown> = {}) {
 }
 
 const rowOf = async (name: string) => (await screen.findByText(name)).closest('tr') as HTMLElement;
+
+/** 四个动作的假响应：没登记的请求会 404，所以每个用例都得把要点的那个动作登记上。 */
+const actions = (extra: Record<string, unknown> = {}) => ({
+  [`POST ${B}/automations/*/pause`]: jsonResponse({ id: 'schedule-1' }),
+  [`POST ${B}/automations/*/resume`]: jsonResponse({ id: 'schedule-1' }),
+  [`POST ${B}/automations/*/run`]: jsonResponse({ id: 'schedule-1' }),
+  [`DELETE ${B}/automations/*`]: jsonResponse({ id: 'schedule-1', deleted: true }),
+  ...extra,
+});
 
 describe('自动化页', () => {
   it('两个视图各列自己名下的任务', async () => {
@@ -265,5 +280,97 @@ describe('自动化页', () => {
     const ran = within(sheet).getByText('第 1 次').closest('tr') as HTMLElement;
     expect(within(ran).getByText('失败')).toBeInTheDocument();
     expect(fetch.find('GET', `${B}/automations/schedule-1/history`)).toHaveLength(1);
+  });
+
+  it('点「暂停」发 POST .../pause，成功后提示已暂停', async () => {
+    const fetch = api([task()], actions());
+    renderWithApp(<AutomationsPage />, { route: '/automations' });
+    const row = await rowOf('每日站会提醒');
+    await userEvent.click(within(row).getByRole('button', { name: '暂停' }));
+
+    expect(fetch.find('POST', `${B}/automations/schedule-1/pause`)).toHaveLength(1);
+    expect(await screen.findByText('已暂停')).toBeInTheDocument();
+  });
+
+  it('已暂停的任务显示「恢复」，点它发 POST .../resume', async () => {
+    const fetch = api([task({ status: 'paused' })], actions());
+    renderWithApp(<AutomationsPage />, { route: '/automations' });
+    const row = await rowOf('每日站会提醒');
+    expect(within(row).queryByRole('button', { name: '暂停' })).not.toBeInTheDocument();
+    await userEvent.click(within(row).getByRole('button', { name: '恢复' }));
+
+    expect(fetch.find('POST', `${B}/automations/schedule-1/resume`)).toHaveLength(1);
+    expect(await screen.findByText('已恢复')).toBeInTheDocument();
+  });
+
+  it('正在执行或排队的任务：「立即运行」不可点，并说明原因', async () => {
+    api([task({ executionActive: true })], actions());
+    renderWithApp(<AutomationsPage />, { route: '/automations' });
+    const row = await rowOf('每日站会提醒');
+    const run = within(row).getByRole('button', { name: '立即运行' });
+    expect(run).toBeDisabled();
+    expect(run).toHaveAttribute('title', '这个任务正在运行或排队，等它结束再试');
+  });
+
+  it('点「立即运行」发 POST .../run，成功后提示已立即运行', async () => {
+    const fetch = api([task()], actions());
+    renderWithApp(<AutomationsPage />, { route: '/automations' });
+    const row = await rowOf('每日站会提醒');
+    await userEvent.click(within(row).getByRole('button', { name: '立即运行' }));
+
+    expect(fetch.find('POST', `${B}/automations/schedule-1/run`)).toHaveLength(1);
+    expect(await screen.findByText('已立即运行')).toBeInTheDocument();
+  });
+
+  it('点「删除」先确认，确认后发 DELETE 并重新拉列表', async () => {
+    const fetch = api([task()], actions());
+    renderWithApp(<AutomationsPage />, { route: '/automations' });
+    const row = await rowOf('每日站会提醒');
+    await userEvent.click(within(row).getByRole('button', { name: '删除' }));
+
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByText('删除这条定时任务？')).toBeInTheDocument();
+    expect(
+      within(dialog).getByText('删掉后不再触发，但已经跑过的对话和消息还留着，可以照常打开。'),
+    ).toBeInTheDocument();
+    await userEvent.click(within(dialog).getByRole('button', { name: '删除' }));
+
+    expect(fetch.find('DELETE', `${B}/automations/schedule-1`)).toHaveLength(1);
+    expect(await screen.findByText('已删除')).toBeInTheDocument();
+    // 成功后让列表失效重拉：刷新过的列表里已经没有这条
+    expect(fetch.find('GET', `${B}/automations`).length).toBeGreaterThan(1);
+  });
+
+  it('删除确认框点「取消」不发 DELETE', async () => {
+    const fetch = api([task()], actions());
+    renderWithApp(<AutomationsPage />, { route: '/automations' });
+    const row = await rowOf('每日站会提醒');
+    await userEvent.click(within(row).getByRole('button', { name: '删除' }));
+    const dialog = await screen.findByRole('dialog');
+    await userEvent.click(within(dialog).getByRole('button', { name: '取消' }));
+    expect(fetch.find('DELETE', `${B}/automations/schedule-1`)).toHaveLength(0);
+  });
+
+  it('宿主回 409 正在运行/排队时，toast 原样显示服务端的话', async () => {
+    const fetch = api(
+      [task()],
+      actions({
+        [`POST ${B}/automations/*/run`]: jsonResponse(
+          {
+            detail: {
+              code: 'schedule_execution_pending',
+              message: '这个任务正在运行或排队，等它结束再试',
+            },
+          },
+          409,
+        ),
+      }),
+    );
+    renderWithApp(<AutomationsPage />, { route: '/automations' });
+    const row = await rowOf('每日站会提醒');
+    await userEvent.click(within(row).getByRole('button', { name: '立即运行' }));
+
+    expect(fetch.find('POST', `${B}/automations/schedule-1/run`)).toHaveLength(1);
+    expect(await screen.findByRole('alert')).toHaveTextContent('这个任务正在运行或排队，等它结束再试');
   });
 });

@@ -433,6 +433,46 @@ def build_router(kernel: HostKernel, current_actor: ActorDependency,
         entry = await describe(updated, who)
         return _written(entry)
 
+    @router.post("/{schedule_id}/pause")
+    async def pause_automation(schedule_id: ScheduleId, who: Who):
+        """暂停：到点不再触发。只把 active 关掉，其余字段一概不碰。"""
+        try:
+            updated = await kernel.edit_schedule(schedule_id,
+                                                {"action": "update", "patch": {"active": False}},
+                                                owner=owner_of(who))
+        except HOST_ERRORS as error:
+            raise write_error(error, "pause schedule") from error
+        return _written(await describe(updated, who))
+
+    @router.post("/{schedule_id}/resume")
+    async def resume_automation(schedule_id: ScheduleId, who: Who):
+        """恢复：宿主按 patch.active=true 重算下一次运行时间，业务服务不自己算。"""
+        try:
+            updated = await kernel.edit_schedule(schedule_id,
+                                                {"action": "update", "patch": {"active": True}},
+                                                owner=owner_of(who))
+        except HOST_ERRORS as error:
+            raise write_error(error, "resume schedule") from error
+        return _written(await describe(updated, who))
+
+    @router.post("/{schedule_id}/run")
+    async def run_automation(schedule_id: ScheduleId, who: Who):
+        """立即运行一次：宿主立刻发起一轮，原来的下次运行时间不变。正在跑/排队时宿主回 409。"""
+        try:
+            entry = await kernel.run_schedule(schedule_id, owner=owner_of(who))
+        except HOST_ERRORS as error:
+            raise write_error(error, "run schedule") from error
+        return _written(await describe(entry, who))
+
+    @router.delete("/{schedule_id}")
+    async def delete_automation(schedule_id: ScheduleId, who: Who):
+        """删掉任务：宿主侧不再触发；它跑过的对话与消息不在这里，删不掉。"""
+        try:
+            await kernel.delete_schedule(schedule_id, owner=owner_of(who))
+        except HOST_ERRORS as error:
+            raise write_error(error, "delete schedule") from error
+        return {"deleted": True}
+
     return router
 
 

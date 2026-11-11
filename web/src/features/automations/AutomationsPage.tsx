@@ -21,16 +21,18 @@ import { Warning } from '@openai/apps-sdk-ui/components/Icon';
 import { Link, useSearchParams } from 'react-router';
 import type { Automation, DeliveryRecord, LastRun as LastRunInfo } from '../../api/automations';
 import { readableError } from '../../api/http';
+import { confirm } from '../../ui/confirmStore';
 import { Empty } from '../../ui/Empty';
 import { Sheet } from '../../ui/Sheet';
 import { Skeleton } from '../../ui/Skeleton';
 import { Table, type Column } from '../../ui/Table';
 import { Tabs } from '../../ui/Tabs';
+import { toast } from '../../ui/toastStore';
 import { formatDateTime } from '../../utils/format';
 import { AdminPage, Toolbar } from '../admin/AdminPage';
 import AutomationForm from './AutomationForm';
 import { RUN_STATUS_TEXT, scheduleText, STATUS_TEXT } from './model';
-import { useAutomationHistory, useAutomations } from './queries';
+import { useAutomationAction, useAutomationHistory, useAutomations } from './queries';
 
 /** 一条任务在表格里的一行：标题、中文时间规则、下次运行、最近一次跑成什么样、状态。 */
 const COLUMNS: readonly Column<Automation>[] = [
@@ -152,6 +154,7 @@ function AutomationList({
   readonly onEdit: (task: Automation) => void;
 }) {
   const automations = useAutomations();
+  const action = useAutomationAction();
   const [opened, setOpened] = useState<Automation | undefined>(undefined);
 
   // 读失败：明确说「暂时读不到」，绝不当成空列表——那会让人以为任务被删了
@@ -174,6 +177,28 @@ function AutomationList({
 
   const all = automations.data?.items ?? [];
   const rows = all.filter((task) => task.origin === origin);
+
+  // 四个动作都走同一个 mutation：成功刷新列表，失败把宿主的话原样提示出来（409 的文案尤其要照说）。
+  const runAction = async (task: Automation, kind: 'pause' | 'resume' | 'run' | 'delete', okText: string) => {
+    try {
+      await action.mutateAsync({ id: task.id, kind });
+      toast.success(okText);
+    } catch (error) {
+      toast.error(readableError(error));
+    }
+  };
+
+  const confirmDelete = async (task: Automation) => {
+    const ok = await confirm({
+      title: '删除这条定时任务？',
+      description: '删掉后不再触发，但已经跑过的对话和消息还留着，可以照常打开。',
+      okText: '删除',
+      danger: true,
+    });
+    if (!ok) return;
+    await runAction(task, 'delete', '已删除');
+  };
+
   const columns: readonly Column<Automation>[] = [
     ...COLUMNS,
     {
@@ -214,6 +239,64 @@ function AutomationList({
         </Button>
       ),
     },
+    {
+      key: 'actions',
+      title: '操作',
+      width: 260,
+      render: (task) => (
+        <div className="kw-row-actions">
+          {task.status === 'active' ? (
+            <Button
+              color="secondary"
+              variant="ghost"
+              size="sm"
+              onClick={(event) => {
+                event.stopPropagation();
+                void runAction(task, 'pause', '已暂停');
+              }}
+            >
+              暂停
+            </Button>
+          ) : (
+            <Button
+              color="secondary"
+              variant="ghost"
+              size="sm"
+              onClick={(event) => {
+                event.stopPropagation();
+                void runAction(task, 'resume', '已恢复');
+              }}
+            >
+              恢复
+            </Button>
+          )}
+          <Button
+            color="secondary"
+            variant="ghost"
+            size="sm"
+            disabled={task.executionActive === true}
+            title={task.executionActive === true ? '这个任务正在运行或排队，等它结束再试' : undefined}
+            onClick={(event) => {
+              event.stopPropagation();
+              void runAction(task, 'run', '已立即运行');
+            }}
+          >
+            立即运行
+          </Button>
+          <Button
+            color="secondary"
+            variant="ghost"
+            size="sm"
+            onClick={(event) => {
+              event.stopPropagation();
+              void confirmDelete(task);
+            }}
+          >
+            删除
+          </Button>
+        </div>
+      ),
+    },
   ];
 
   return (
@@ -222,7 +305,7 @@ function AutomationList({
         rowKey={(task) => task.id}
         columns={columns}
         rows={rows}
-        minWidth={1070}
+        minWidth={1320}
         loading={automations.isFetching}
         onRowClick={setOpened}
         empty={all.length === 0 ? '还没有定时任务' : '这一栏里还没有任务'}

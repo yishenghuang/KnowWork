@@ -264,6 +264,20 @@ class HostKernel:
         _raise_for(response)
         return response.json()
 
+    async def run_schedule(self, schedule_id: str, *, owner: SessionOwner | None) -> dict:
+        """立即运行一次。宿主回 202 与任务 entry；正在跑/排队时 settled 把它转成 409 schedule_execution_pending。"""
+        path = f"/v1/schedule/{_segment(schedule_id)}/run"
+        response = await self._client.post(path, headers=_owner_headers(owner))
+        _raise_for(response)
+        return response.json()
+
+    async def delete_schedule(self, schedule_id: str, *, owner: SessionOwner | None) -> dict:
+        """删掉一条定时任务。宿主的 DELETE 读空体即可，不需要请求体；成功回 {id, deleted: true}。"""
+        path = f"/v1/schedule/{_segment(schedule_id)}"
+        response = await self._client.delete(path, headers=_owner_headers(owner))
+        _raise_for(response)
+        return response.json()
+
     async def subscribe(self, session_id: str, *, after: int = 0, epoch: str | None = None) -> AsyncIterator[KernelEvent]:
         params: dict[str, str | int] = {"after": after}
         if epoch is not None:
