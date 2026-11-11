@@ -26,9 +26,10 @@ class ConversationProfiles:
         self._compiler = compiler
         self._bindings = bindings
 
-    async def compile(self, conversation: ConversationLike, selection: TurnSelection = NO_SELECTION) -> RuntimeProfile:
+    async def compile(self, conversation: ConversationLike, selection: TurnSelection = NO_SELECTION,
+                      readonly: bool = False) -> RuntimeProfile:
         return await self._compiler.compile(workspace_id=conversation.workspace_id, user_id=conversation.user_id,
-                                            session_id=conversation.id, selection=selection)
+                                            session_id=conversation.id, selection=selection, readonly=readonly)
 
     async def bound_version(self, conversation: ConversationLike) -> str | None:
         return await self._bindings.version_of(conversation.workspace_id, conversation.id)

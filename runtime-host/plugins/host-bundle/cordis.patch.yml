@@ -240,6 +240,11 @@
       config:
         backend: json
 
+    # 会话创建能力：定时任务到点要新建一段对话时，官方服务调这里的 create 建会话。属主编在任务的 agentPreset
+    # 令牌里（业务服务铸造、宿主校验），业务服务先按 id 建出后台对话并绑好只读运行配置，这里才把属主记进账本
+    - id: knowwork-session-controller
+      name: '@knowwork/dsh-host/session-controller'
+
     # 官方定时任务：服务换成多用户适配过的（multi-user/schedule.mjs：建任务记属主、只看得到自己的、到点经业务服务激活），
     # 工具原样用官方的 schedule_create / list / view / edit
     - id: schedule

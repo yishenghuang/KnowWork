@@ -56,6 +56,8 @@ class ProfileFacts:
     knowledge: tuple[KnowledgeEntry, ...] = ()
     selection: TurnSelection = field(default=NO_SELECTION)
     host_denied: tuple[str, ...] = ()
+    # 只读运行配置：自动化（定时任务）建的对话用，除只读工具外一个都不给
+    readonly: bool = False
 
 
 def compile_profile(facts: ProfileFacts) -> RuntimeProfile:
@@ -67,6 +69,11 @@ def compile_profile(facts: ProfileFacts) -> RuntimeProfile:
                               dropped_conditions=selection.dropped_conditions, pins=selection.pins)
     tools = _tools(facts.tools, facts.permitted_tools, facts.builtin_tools)
     allowed = {tool.name for tool in tools}
+    if facts.readonly:
+        # 自动化跑的时候没有人看着：会写、会动外部系统的工具一律不给，不等审批超时。
+        # 只读工具之外的（包括本来就没授权的）都进拒绝清单，宿主那边同时见不到它们
+        tools = tuple(tool for tool in tools if tool.risk == "read")
+        allowed = {tool.name for tool in tools}
     knowledge, bound = _knowledge(facts.knowledge, selection.knowledge_bases)
     return RuntimeProfile(
         workspace_id=facts.workspace_id, user_id=facts.user_id, role=facts.role, member=True,
@@ -82,8 +89,6 @@ def _denied(names: Iterable[str], host_denied: tuple[str, ...]) -> tuple[str, ..
 def _tools(specs: Iterable[ToolSpec], permitted: frozenset[str], builtin: frozenset[str]) -> tuple[ProfileTool, ...]:
     chosen = {spec.name: spec for spec in specs if spec.name in permitted}
     return tuple(ProfileTool(name=name, risk=chosen[name].risk, builtin=name in builtin) for name in sorted(chosen))
-
-
 
 
 def _skills(entries: Iterable[Any], selected: tuple[str, ...] | None) -> tuple[ProfileSkill, ...]:

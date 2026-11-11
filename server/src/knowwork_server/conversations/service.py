@@ -15,6 +15,7 @@
 
 import asyncio
 import logging
+import re
 import uuid
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -68,6 +69,8 @@ log = logging.getLogger(__name__)
 RESUME_RETRY_DELAYS = (0.1, 0.3, 1.0)
 # 宿主「接着记录」打开失败的错误码：DSH 第一轮跑起来才写会话记录，一轮都没开始过的会话也是这个错
 OPEN_FAILED = "session_open_failed"
+# 会话 id 的取值范围：与宿主 HTTP 面的 SESSION_ID_PATTERN 一致（宿主新建对话时按它预留 id，重放时也按它校验）
+SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 CATALOG_TIMEOUT = 3.0  # 知识库目录最多等这么久（KnowFlow 要远程列库），超了这轮就不带，宿主沿用上一轮的
 # 本轮的知识库目录：按会话发起人与运行配置里的知识范围算
 KnowledgeCatalogOf = Callable[[Conversation, RuntimeProfile], Awaitable[KnowledgeCatalog]]
@@ -86,7 +89,8 @@ class ConversationNotFound(Exception):
 class ProfileProvider(Protocol):
     """运行配置的编译与绑定（实现见 profile.runtime.ConversationProfiles）。"""
 
-    async def compile(self, conversation: Conversation, selection: TurnSelection = NO_SELECTION) -> RuntimeProfile: ...
+    async def compile(self, conversation: Conversation, selection: TurnSelection = NO_SELECTION,
+                      readonly: bool = False) -> RuntimeProfile: ...
 
     async def bound(self, conversation: Conversation) -> RuntimeProfile | None: ...
 
@@ -152,10 +156,16 @@ class ConversationService:
         """宿主策略取自编译出的运行配置：deny 是用户此刻无权使用的工具名。没装配编译器时不收窄。"""
         return SessionPolicy() if profile is None else profile.policy()
 
-    async def _profile(self, conversation: Conversation, selection: TurnSelection) -> RuntimeProfile | None:
+    async def _profile(self, conversation: Conversation, selection: TurnSelection,
+                       readonly: bool = False) -> RuntimeProfile | None:
+        """编译这次运行要用的配置。readonly 只给自动化建的对话：编译时把所有非只读工具塞进拒绝清单。
+
+        不显式传 readonly 时按会话自己的标记算（Conversation.readonly）：自动化对话被宿主回收、
+        业务服务重启之后重新打开，仍然只给只读工具。"""
         if self._profiles is None:
             return None
-        return await self._profiles.compile(conversation, selection)
+        readonly = readonly or getattr(conversation, "readonly", False)
+        return await self._profiles.compile(conversation, selection, readonly=readonly)
 
     async def _bind(self, conversation: Conversation, profile: RuntimeProfile | None) -> None:
         if self._profiles is not None and profile is not None:
@@ -179,14 +189,27 @@ class ConversationService:
                 credentials.track(conversation)
 
     async def create(self, *, workspace_id: str, user_id: str, title: str = "",
-                     selection: TurnSelection = NO_SELECTION, background: bool = False) -> Conversation:
-        conversation = Conversation(id=f"c_{uuid.uuid4().hex}", workspace_id=workspace_id, user_id=user_id, title=title,
-                                    background=background)
+                     selection: TurnSelection = NO_SELECTION, background: bool = False,
+                     conversation_id: str | None = None, readonly: bool = False) -> Conversation:
+        """建一段对话并在宿主上打开它。
+
+        conversation_id 给定时用它当 id（宿主新建对话时按它预留了会话 id）；这段 id 已经存在时直接返回已有的那段——
+        官方 new_once 目标在会话建起来之前会重放同一个 id，重放不该失败。
+        readonly 只用于自动化建的对话：运行配置里只留只读工具，不落库（跟着创建方走，每次打开时重算）。
+        """
+        if conversation_id is not None:
+            if not SESSION_ID_PATTERN.match(conversation_id):
+                raise ValueError(f"会话 id 只允许字母、数字和 _.:-，最长 128：{conversation_id}")
+            existing = await self._find_any(conversation_id)
+            if existing is not None:
+                return existing
+        conversation = Conversation(id=conversation_id or f"c_{uuid.uuid4().hex}", workspace_id=workspace_id,
+                                    user_id=user_id, title=title, background=background, readonly=readonly)
         async with self._sessionmaker() as session:
             session.add(conversation)
             await session.commit()
         try:
-            profile = await self._profile(conversation, selection)
+            profile = await self._profile(conversation, selection, readonly)
             await self._kernel.open_session(await self._spec(conversation, resume=False, profile=profile))
             await self._bind(conversation, profile)
         except BaseException:
@@ -195,6 +218,11 @@ class ConversationService:
         self._opened(conversation)
         self._pump.ensure(conversation.id, workspace_id)
         return conversation
+
+    async def _find_any(self, conversation_id: str) -> Conversation | None:
+        """按 id 取会话，不判空间与用户（宿主重放同一个会话 id 时用；归属由调用方判）。"""
+        async with self._sessionmaker() as session:
+            return (await session.execute(select(Conversation).where(Conversation.id == conversation_id))).scalar_one_or_none()
 
     async def _forget(self, conversation_id: str) -> None:
         try:

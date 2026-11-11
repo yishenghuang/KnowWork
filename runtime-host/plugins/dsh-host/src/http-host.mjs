@@ -27,7 +27,8 @@ import { catalogOf } from './knowledge-catalog.mjs'
 import { mentionBlocks, mentionsOf } from './mentions.mjs'
 import { receiveTurnContext, turnContextOf } from './turn-context.mjs'
 import { BUILT_IN_MODES, MODE_PATTERN, answerModeSpecOf } from './answer-mode.mjs'
-import { runAs } from './multi-user/caller.mjs'
+import { runAs, sameOwner } from './multi-user/caller.mjs'
+import { ownerOfToken } from './multi-user/preset-token.mjs'
 import { deploymentTimeZone, userSource } from './message-source.mjs'
 
 // DSH 版本号随 /health 一起报给业务服务，系统信息页显示（所有 @deepseek-ai 包锁在同一版本）
@@ -47,6 +48,9 @@ const SCHEDULE_ID_PATTERN = /^[A-Za-z0-9_.:-]{1,128}$/
 const OWNER_WORKSPACE_HEADER = 'x-knowwork-owner-workspace'
 const OWNER_USER_HEADER = 'x-knowwork-owner-user'
 const CREDENTIAL_ACTIONS = new Set(['tool-credential', 'skill-credential'])
+// 官方远程方法（remoteCreate / remoteEdit / remoteList …）把输入校验错误包成这个 code 的 RemoteError，
+// 原来的 ScheduleInputError.code 在 details.code 里
+const REMOTE_INPUT_INVALID = 'schedule/input-invalid'
 
 class HttpError extends Error {
   constructor(status, code, message) {
@@ -540,8 +544,9 @@ export function apply(ctx, config) {
     try {
       return await (owner === undefined ? fn() : runAs({ owner }, fn))
     } catch (error) {
-      // 官方的输入校验（limit、offset 不合规）是请求本身不合规，不是宿主出错
-      if (error instanceof Error && error.name === 'ScheduleInputError') {
+      // 官方的输入校验（limit、offset、rrule、target 不合规）是请求本身不合规，不是宿主出错。
+      // 直接调的方法抛 ScheduleInputError，远程方法把它包成 code 为 schedule/input-invalid 的 RemoteError
+      if (error instanceof Error && (error.name === 'ScheduleInputError' || error.code === REMOTE_INPUT_INVALID)) {
         throw new HttpError(400, 'invalid_request', error.message)
       }
       throw error
@@ -573,6 +578,95 @@ export function apply(ctx, config) {
       .then(found)
   }
 
+  /**
+   * 定时任务写侧：建、改、删、立即运行。四个都直接转官方的远程方法，归属仍是适配层的事（runAs 之后
+   * create/edit/run 都先过 guard），这里只把官方的结果码翻成 HTTP：
+   * - schedule_not_found → 404（不是调用者的任务，适配层也回这个）；
+   * - schedule_conflict → 409（带 expectedUpdatedAt 时任务刚被别人改过）；
+   * - schedule_execution_pending → 409（这个任务正在运行或排队）。
+   * 写侧必须带调用者身份：没身份就建得出无处归属的任务，所以缺了直接 400。
+   */
+  function writerOf(req) {
+    const owner = callerOwnerOf(req.headers)
+    if (owner === undefined) throw new HttpError(400, 'invalid_request', '写定时任务要在请求头里带上调用者身份')
+    return owner
+  }
+
+  /**
+   * 页面建「每次新建对话」的任务时带的是业务服务铸的属主令牌：建之前先校验，令牌不对、或令牌里的属主不是这次调用者，
+   * 当场拒绝——不能把一条到点必然建不出对话的半成品任务留在调度器里。
+   * @param {any} body 请求体
+   * @param {import('./multi-user/caller.mjs').Owner} caller 这次调用者
+   */
+  function verifiedTarget(body, caller) {
+    const target = body?.target
+    if (target === undefined || target === null || typeof target !== 'object') return
+    if (target.kind !== 'new' && target.kind !== 'new_once') return
+    const preset = target.create?.agentPreset
+    if (typeof preset !== 'string' || preset.length === 0) {
+      throw new HttpError(400, 'invalid_request', '每次新建对话的定时任务必须带属主令牌（target.create.agentPreset）')
+    }
+    const owner = ownerOfToken(preset, token)
+    if (owner === undefined) throw new HttpError(400, 'invalid_request', '定时任务的属主令牌不对，拒绝建这条任务')
+    if (!sameOwner(owner, caller)) throw new HttpError(400, 'invalid_request', '定时任务的属主令牌不是这个人的，拒绝建这条任务')
+  }
+
+  function settled(result) {
+    if (result?.code === 'schedule_conflict') throw new HttpError(409, 'schedule_conflict', '任务刚被改过，请刷新后再改')
+    if (result?.code === 'schedule_execution_pending') throw new HttpError(409, 'schedule_execution_pending', '这个任务正在运行或排队，等它结束再试')
+    return found(result)
+  }
+
+  /**
+   * 「预留了会话 id」的任务（new_once）在官方 create 时就定下了那段对话的 id，到点先按这个 id 找宿主上有没有活会话，
+   * 没有才走建会话。建会话得靠业务服务（后台对话、只读配置都在业务服务那边），所以这里建任务时就把对话建出来：
+   * 到点直接投递，不会留一条到点才发现建不出对话的半成品任务。建不出来就把刚建的任务删掉再报错。
+   */
+  async function materialize(created, body, owner) {
+    if (created?.target?.kind !== 'new_once') return
+    const sessionId = created.target.sessionId
+    const controller = ctx.get('sessionController')
+    if (typeof sessionId !== 'string' || controller === undefined) return
+    try {
+      await controller.create({ sessionId, agentPreset: body.target.create.agentPreset })
+    } catch (error) {
+      log.error('schedule %s could not materialize Session %s: %s', created.id, sessionId, String(error))
+      await asCaller(owner, () => scheduleService().remoteEdit({ id: created.id, action: 'delete' })).catch(() => {})
+      throw new HttpError(400, 'invalid_request', '业务服务没有建出这次自动化的对话，任务没有留下，请稍后再建')
+    }
+  }
+
+  /**
+   * 请求体原样交给官方：title、prompt、timing、target 的校验都在官方 create 里，不合规抛 ScheduleInputError。
+   * 只多了属主令牌这一道：官方不认识它，是 KnowWork 自己往 target.create.agentPreset 里放的。
+   */
+  async function createSchedule(owner, body) {
+    verifiedTarget(body, owner)
+    const created = await asCaller(owner, () => scheduleService().remoteCreate(body)).then(settled)
+    await materialize(created, body, owner)
+    return created
+  }
+
+  function editSchedule(owner, id, body, action) {
+    const patch = body.patch
+    if (action === 'update' && (patch === undefined || typeof patch !== 'object' || patch === null || Array.isArray(patch))) {
+      throw new HttpError(400, 'invalid_request', '缺少字段 patch')
+    }
+    // 改投递目标时同样要过属主令牌：换成「每次新建对话」却没带对令牌，改完到点也建不出对话
+    if (action === 'update') verifiedTarget({ target: patch.target }, owner)
+    const request = {
+      id,
+      action,
+      ...(action === 'update' ? { patch } : {}),
+      ...(body.expectedUpdatedAt === undefined ? {} : { expectedUpdatedAt: body.expectedUpdatedAt }),
+    }
+    return asCaller(owner, () => scheduleService().remoteEdit(request)).then(settled)
+  }
+
+  function runSchedule(owner, id) {
+    return asCaller(owner, () => scheduleService().run({ id })).then(settled)
+  }
+
   async function route(req, res) {
     const url = new URL(req.url ?? '/', 'http://host')
     const path = url.pathname
@@ -592,6 +686,23 @@ export function apply(ctx, config) {
       const scheduleId = scheduleIdOf(rawId)
       if (action === undefined) return send(res, 200, await viewSchedule(owner, scheduleId))
       if (action === 'history' && extra === undefined) return send(res, 200, await scheduleHistory(owner, scheduleId, url))
+      throw new HttpError(404, 'not_found', '路径不存在')
+    }
+
+    // 定时任务写侧：POST /v1/schedule、PATCH /v1/schedule/{id}、DELETE /v1/schedule/{id}、POST /v1/schedule/{id}/run
+    if (req.method !== 'GET' && (path === '/v1/schedule' || path.startsWith('/v1/schedule/'))) {
+      const owner = writerOf(req)
+      if (path === '/v1/schedule') {
+        if (req.method !== 'POST') throw new HttpError(404, 'not_found', '路径不存在')
+        return send(res, 201, await createSchedule(owner, await readJson(req)))
+      }
+      const [rawId, action, extra] = path.slice('/v1/schedule/'.length).split('/')
+      if (rawId === undefined || rawId === '' || extra !== undefined) throw new HttpError(404, 'not_found', '路径不存在')
+      const scheduleId = scheduleIdOf(rawId)
+      if (action === undefined && req.method === 'PATCH') return send(res, 200, await editSchedule(owner, scheduleId, await readJson(req), 'update'))
+      // 删除只需要 id 与（可选的）expectedUpdatedAt，不用 patch
+      if (action === undefined && req.method === 'DELETE') return send(res, 200, await editSchedule(owner, scheduleId, await readJson(req), 'delete'))
+      if (action === 'run' && req.method === 'POST') return send(res, 202, await runSchedule(owner, scheduleId))
       throw new HttpError(404, 'not_found', '路径不存在')
     }
 

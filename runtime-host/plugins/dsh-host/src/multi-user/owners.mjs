@@ -31,9 +31,19 @@ export default class KnowWorkOwners extends Service {
     return this.ledger.ownerOf(kind, id)
   }
 
+  /**
+   * 直接记一笔属主级资源归谁（不经过调用者）。
+   * 创建会话的插件用它把「这段会话属谁」写进账本：那段会话还没有对话记录，业务服务回头要靠它知道该找哪个空间。
+   * @param {string} kind @param {string} id @param {import('./caller.mjs').Owner} owner
+   */
+  own(kind, id, owner) {
+    this.ledger.record([[kind, id, owner]])
+  }
+
   /** 调用者建了一个属主级资源：资源和发起它的对话都记到调用者名下。 */
   claim(kind, id, caller) {
-    const session = this.ledger.ownerOf(SESSION, caller.sessionId) === undefined
+    // 调用者未必来自某段对话（HTTP 面按身份头调过来时没有 sessionId）：没有就不记那段对话，别写进一个 undefined 键
+    const session = caller.sessionId !== undefined && this.ledger.ownerOf(SESSION, caller.sessionId) === undefined
       ? [[SESSION, caller.sessionId, caller.owner]]
       : []
     this.ledger.record([[kind, id, caller.owner], ...session])

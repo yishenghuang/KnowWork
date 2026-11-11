@@ -21,6 +21,9 @@ class Conversation(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
     # 后台会话（background.py）：扩展在 worker 里替这个人发起的，例如评测逐题发问；不进本人的「最近」和搜索
     background: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    # 只读会话（automations/internal.py）：自动化建的对话没有人看着，重开时也要按只读编译运行配置，
+    # 所以这个标记要落库——宿主回收会话、业务服务重启之后再打开，仍要把非只读工具全塞进拒绝清单
+    readonly: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
 
 
 class RunEvent(Base):

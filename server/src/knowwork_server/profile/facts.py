@@ -69,9 +69,10 @@ class ProfileCompiler:
         self._s = sources
 
     async def compile(self, *, workspace_id: str, user_id: str, session_id: str,
-                      selection: TurnSelection = NO_SELECTION) -> RuntimeProfile:
+                      selection: TurnSelection = NO_SELECTION, readonly: bool = False) -> RuntimeProfile:
+        """readonly 为真时编出只读运行配置（自动化建的对话用），非只读工具全部进拒绝清单。"""
         try:
-            facts = await self._facts(workspace_id, user_id, session_id, selection)
+            facts = await self._facts(workspace_id, user_id, session_id, selection, readonly)
         except ProfileUnavailable:
             raise
         except Exception as error:
@@ -80,13 +81,13 @@ class ProfileCompiler:
         return compile_profile(facts)
 
     async def _facts(self, workspace_id: str, user_id: str, session_id: str,
-                     selection: TurnSelection) -> ProfileFacts:
+                     selection: TurnSelection, readonly: bool = False) -> ProfileFacts:
         clearance = self._s.clearance
         specs = tuple(await self._s.all_tools(ToolContext(workspace_id=workspace_id, session_id=session_id,
                                                           user_id=user_id)))
         if not clearance.member(user_id, workspace_id):
             return ProfileFacts(workspace_id=workspace_id, user_id=user_id, role=None, member=False, tools=specs,
-                                selection=selection, host_denied=self._s.host_denied)
+                                selection=selection, host_denied=self._s.host_denied, readonly=readonly)
         capabilities = await self._s.models.default_capabilities(workspace_id) or frozenset()
         host_denied = self._s.host_denied if "vision" in capabilities else (*self._s.host_denied, *VISION_TOOLS)
         return ProfileFacts(
@@ -94,7 +95,7 @@ class ProfileCompiler:
             member=True, tools=specs, permitted_tools=clearance.permitted(user_id, workspace_id, [s.name for s in specs]),
             builtin_tools=clearance.builtin_names(), skills=tuple(await self._s.skills.for_session(workspace_id, user_id)),
             knowledge=await self._s.knowledge(user_id, workspace_id), selection=selection,
-            host_denied=host_denied)
+            host_denied=host_denied, readonly=readonly)
 
 
 def knowledge_from_admin(admin: SourceLister) -> KnowledgeOf:

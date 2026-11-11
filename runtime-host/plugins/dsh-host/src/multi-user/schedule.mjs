@@ -3,8 +3,9 @@
  * - 官方 ScheduleService 原样，继承它补归属：建任务记属主（owned-service 的 create），列表只给自己的（list，照官方
  *   resolveListPage 的校验与分页），查看、编辑不是自己的照官方返回「找不到」（guard）；
  * - 到点时官方经 `schedule/resolve-agent` 要活会话：改道给业务服务激活（activation），官方再照常投递；
- * - 投递目标第一版只支持「这个对话」（this_session）：新开对话（new_once、new）要业务服务建对话、定归属，先用工具
- *   调用规则拦住，让模型改用 this_session；
+ * - 投递目标：这个对话（this_session）随便用；新开对话（new_once、new）要业务服务按属主令牌建对话，而工具参数里
+ *   带不了令牌（官方从 agentPresets 取，那是另一回事），所以工具路径下仍然拦下，让模型改用 this_session——页面
+ *   建的自动化走 HTTP 面 remoteCreate，那里带着业务服务铸的令牌；
  * - 时间只收按时区写的本地时间（DTSTART;TZID=…）：官方两种写法都收，但写成 UTC（以 Z 结尾）要模型自己换算时区，
  *   实测把洛杉矶时间换成 UTC 时多加了一小时。按时区写本地时间就不用换算，任务结果里的 scheduledAtLocal 也是用户的
  *   本地时间（官方按 rrule 的时区算）。UNTIL 官方规定写 UTC，不管它。
@@ -19,6 +20,8 @@ import { allOf, applyToolRules } from './tool-rules.mjs'
 
 const KIND = 'schedule'
 const THIS_SESSION_ONLY = 'KnowWork 里定时任务的结果投到发起它的这个对话：target 请改用 this_session 再调一次。'
+const OWNER_REQUIRED = '页面建的自动化必须带属主令牌：target 请改用 this_session 再调一次；'
+  + '要在每次新建的对话里跑，去自动化页面建，那里会带上属主令牌。'
 const LOCAL_TIME_ONLY = 'DTSTART 请按用户的时区写本地时间，不要自己换算成 UTC：写成 DTSTART;TZID=<时区>:YYYYMMDDTHHMMSS，'
   + '时区用时间读数里写的用户时区；用户明确要 UTC 时写 TZID=Etc/UTC。改好再调一次。'
 
@@ -49,7 +52,18 @@ const OwnedSchedule = ownedService(ScheduleService, {
   },
 })
 
-const targetRule = args => args.target === undefined || args.target === 'this_session' ? undefined : THIS_SESSION_ONLY
+/**
+ * 投递目标只放行「这个对话」，以及页面（业务服务）带着属主令牌传来的新对话目标。
+ * 工具参数里的 target 只有 this_session / new_once / new 三个字符串，带不出 create.agentPreset（官方从 agentPresets
+ * 取，取到也不是属主令牌），所以走工具的裸 new_once / new 一律拦下：建出来也会在到点建会话时被令牌校验拒掉。
+ */
+const targetRule = args => {
+  const target = args.target
+  if (target === undefined || target === 'this_session') return undefined
+  if (typeof target !== 'object' || target === null) return OWNER_REQUIRED
+  const preset = target.create?.agentPreset
+  return typeof preset === 'string' && preset.length > 0 ? undefined : OWNER_REQUIRED
+}
 /** DTSTART 那一行写成 UTC（DTSTART:…Z）就拦下；没给 rrule（编辑时只改别的）不管 */
 const localTimeRule = args => typeof args.rrule === 'string' && /^\s*DTSTART:\d{8}T\d{6}Z/im.test(args.rrule)
   ? LOCAL_TIME_ONLY

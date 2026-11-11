@@ -23,6 +23,7 @@
     "./tool-bridge": "./src/tool-bridge.mjs",
     "./test-tools": "./src/test-tools.mjs",
     "./owners": "./src/multi-user/owners.mjs",
-    "./schedule": "./src/multi-user/schedule.mjs"
+    "./schedule": "./src/multi-user/schedule.mjs",
+    "./session-controller": "./src/session-controller.mjs"
   }
 }

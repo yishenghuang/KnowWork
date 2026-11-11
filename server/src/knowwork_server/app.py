@@ -29,6 +29,7 @@ from .attachments.turns import TurnAttachments
 from .audit import AUDIT_SCOPE, AuditModule, build_audit
 from .audit import build_router as audit_router
 from .automations.api import build_router as automations_router
+from .automations.internal import build_automation_conversation_router
 from .channels import Channels, build_channels
 from .channels import build_router as channels_router
 from .config import Settings
@@ -628,6 +629,9 @@ def create_internal_app(runtime: Runtime) -> FastAPI:
         member=member))
     # 宿主上的插件自己发起一轮前（定时任务到点）来这里激活对话
     app.include_router(build_activation_router(runtime.service, settings.host_token.get_secret_value(), member=member))
+    # 宿主上的定时任务到点要新开一段对话时来这里：按它预留的会话 id 建后台对话，绑只读运行配置（见 automations/internal.py）
+    app.include_router(build_automation_conversation_router(runtime.service, settings.host_token.get_secret_value(),
+                                                            member=member))
     if runtime.sandbox is not None:
         membership = ToolClearance(runtime.access, builtin=frozenset())
         app.include_router(sandbox_internal_router(runtime.sandbox.sandbox, runtime.tools, membership.member,
