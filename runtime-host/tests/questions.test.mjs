@@ -150,31 +150,40 @@ async function askThenStop(signal) {
   return first.host.home
 }
 
-// 关闭方式有两种，落盘结果只有一种：只要提问已经落到会话日志里（tool/call 记下了），被杀和正常关闭
-// 恢复后都是 continued、都还能答——官方恢复时把没有结果的调用记成未知结果。早先这里有一条「正常关闭
-// 记成已中止、恢复后不能再答」的哨兵，它成立的前提是事件流在 request/header 大帧处被掐断、测试在提问
-// 落盘之前就把宿主停掉了（那个截断 bug 已修）。现在按实测把两种关闭方式一起断言。
-for (const signal of ['SIGKILL', 'SIGTERM']) {
-  test(`宿主在等待中被${signal === 'SIGKILL' ? '杀' : '正常关闭'}：恢复会话后没答完的问题仍可回答`, async () => {
-    const home = await askThenStop(signal)
-    const second = await startQuestionHost([{ text: '收到，按 PDF 导出' }], {}, { home })
-    try {
-      const { host } = second
-      assert.equal((await host.call('POST', '/v1/sessions', { sessionId: 'q-crash', resume: true, policy: {} })).status, 201)
-      const listed = await host.call('GET', '/v1/sessions/q-crash/questions')
-      assert.deepEqual(listed.body.map(q => [q.id, q.state]), [['call_1', 'continued']])
-      assert.deepEqual(listed.body[0].questions, QUESTIONS)
-      const queued = await host.call('POST', '/v1/sessions/q-crash/questions/call_1', { answers: [{ id: 'fmt', selected: ['PDF'] }] })
-      assert.equal(queued.status, 200)
-      const frames = await collectEvents(host, 'q-crash', isTurnEnd)
-      assert.equal(frameOf(frames, 'question/answered')?.data.late, true)
-      assert.equal(turnEndReason(frames), 'completed')
-      assert.ok(messagesText(second.gateway.requests.at(-1)).includes('answer_to_pending_question'))
-    } finally {
-      await second.stop()
-    }
-  })
-}
+test('宿主在等待中被杀：恢复会话后没答完的问题仍可回答', async () => {
+  const home = await askThenStop('SIGKILL')
+  const second = await startQuestionHost([{ text: '收到，按 PDF 导出' }], {}, { home })
+  try {
+    const { host } = second
+    assert.equal((await host.call('POST', '/v1/sessions', { sessionId: 'q-crash', resume: true, policy: {} })).status, 201)
+    const listed = await host.call('GET', '/v1/sessions/q-crash/questions')
+    assert.deepEqual(listed.body.map(q => [q.id, q.state]), [['call_1', 'continued']])
+    assert.deepEqual(listed.body[0].questions, QUESTIONS)
+    const queued = await host.call('POST', '/v1/sessions/q-crash/questions/call_1', { answers: [{ id: 'fmt', selected: ['PDF'] }] })
+    assert.equal(queued.status, 200)
+    const frames = await collectEvents(host, 'q-crash', isTurnEnd)
+    assert.equal(frameOf(frames, 'question/answered')?.data.late, true)
+    assert.equal(turnEndReason(frames), 'completed')
+    assert.ok(messagesText(second.gateway.requests.at(-1)).includes('answer_to_pending_question'))
+  } finally {
+    await second.stop()
+  }
+})
+
+test('上游行为哨兵：宿主正常关闭时官方把前台等待中的提问记成已中止，恢复后不能再答', async () => {
+  // 失败了说明上游改了关闭语义，问题能跨正常重启保留了：同步更新 question-broker 注释与提问卡片文案
+  const home = await askThenStop('SIGTERM')
+  const second = await startQuestionHost([{ text: '收到' }], {}, { home })
+  try {
+    const { host } = second
+    assert.equal((await host.call('POST', '/v1/sessions', { sessionId: 'q-crash', resume: true, policy: {} })).status, 201)
+    assert.deepEqual((await host.call('GET', '/v1/sessions/q-crash/questions')).body, [])
+    const answered = await host.call('POST', '/v1/sessions/q-crash/questions/call_1', { answers: [{ id: 'fmt', selected: ['PDF'] }] })
+    assert.equal(answered.body.error?.code, 'question_not_found')
+  } finally {
+    await second.stop()
+  }
+})
 
 test('待办：todo_write 整表写入，落成 todo/write 会话事件；非法列表以工具错误返回', async () => {
   const todos = [{ content: '读取合同', status: 'completed' }, { content: '抽取条款', status: 'in_progress' }, { content: '生成台账', status: 'pending' }]
