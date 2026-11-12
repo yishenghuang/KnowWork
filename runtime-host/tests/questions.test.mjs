@@ -141,6 +141,13 @@ test('不限时的提问到等待上限按超时关闭；取消回合与释放�
   }
 })
 
+/**
+ * 正常关闭（SIGTERM）的语义只有 POSIX 上有：Windows 上 node 的 kill('SIGTERM') 直接终止进程，
+ * 与 SIGKILL 没区别，这里测不到「优雅关闭」。所以那条哨兵在 Windows 上跳过，不改成断言 continued，
+ * 免得把平台差异写进对上游行为的记录里。
+ */
+const skipGracefulStop = process.platform === 'win32' ? 'Windows 上没有 SIGTERM 优雅关闭语义' : undefined
+
 async function askThenStop(signal) {
   const first = await startQuestionHost([ASK, { text: '先等你回答' }])
   await first.host.call('POST', '/v1/sessions', { sessionId: 'q-crash' })
@@ -170,7 +177,7 @@ test('宿主在等待中被杀：恢复会话后没答完的问题仍可回答',
   }
 })
 
-test('上游行为哨兵：宿主正常关闭时官方把前台等待中的提问记成已中止，恢复后不能再答', async () => {
+test('上游行为哨兵：宿主正常关闭时官方把前台等待中的提问记成已中止，恢复后不能再答', { skip: skipGracefulStop }, async () => {
   // 失败了说明上游改了关闭语义，问题能跨正常重启保留了：同步更新 question-broker 注释与提问卡片文案
   const home = await askThenStop('SIGTERM')
   const second = await startQuestionHost([{ text: '收到' }], {}, { home })
