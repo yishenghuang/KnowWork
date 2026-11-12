@@ -29,7 +29,14 @@ import { rule, useForm } from '../../ui/form';
 import { NumberInput } from '../../ui/NumberInput';
 import { toast } from '../../ui/toastStore';
 import AssistantBox from './AssistantBox';
-import { buildRules, describeRule, MIN_INTERVAL_MINUTES, parseRule, type Preset, type Weekday } from './model';
+import {
+  buildRules,
+  describeRule,
+  MIN_INTERVAL_MINUTES,
+  parseRule,
+  type Preset,
+  type Weekday,
+} from './model';
 import { AUTOMATION_KEYS } from './queries';
 
 /** 表单里正在编辑的那份预设：参数先按输入框原样留着，落库前才校验、才规整。 */

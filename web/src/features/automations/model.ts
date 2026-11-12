@@ -33,7 +33,12 @@ export type Preset =
   /** 每天：可以多个时刻，每个时刻一条规则。 */
   | { readonly kind: 'daily'; readonly every: number; readonly times: readonly string[] }
   | { readonly kind: 'workdays'; readonly every: number; readonly time: string }
-  | { readonly kind: 'weekly'; readonly every: number; readonly days: readonly Weekday[]; readonly time: string }
+  | {
+      readonly kind: 'weekly';
+      readonly every: number;
+      readonly days: readonly Weekday[];
+      readonly time: string;
+    }
   /** 每月某日：day 是 1..31，-1 表示当月最后一天。 */
   | { readonly kind: 'monthly'; readonly every: number; readonly day: number; readonly time: string }
   /** 认不出的规则原样留着，不硬塞进上面任何一种。 */
@@ -152,10 +157,7 @@ interface Parts {
 /** 拆开「DTSTART... 
  RRULE:...」；不是这个形状就返回 undefined（当自定义处理）。 */
 function split(rrule: string): Parts | undefined {
-  const lines = rrule
-    .trim()
-    .split(/\r?\n/)
-    .filter(Boolean);
+  const lines = rrule.trim().split(/\r?\n/).filter(Boolean);
   const startLine = lines.find((line) => line.startsWith('DTSTART'));
   const ruleLine = lines.find((line) => line.startsWith('RRULE:'));
   if (!startLine || !ruleLine) return undefined;
@@ -253,16 +255,18 @@ export function describeRule(rrule: string): string {
         ? `每天 ${preset.times.join('、')}`
         : `每 ${preset.every} 天 ${preset.times.join('、')}`;
     case 'workdays':
-      return preset.every === 1
-        ? `工作日 ${preset.time}`
-        : `每 ${preset.every} 周的工作日 ${preset.time}`;
+      return preset.every === 1 ? `工作日 ${preset.time}` : `每 ${preset.every} 周的工作日 ${preset.time}`;
     case 'weekly': {
       const days = preset.days.map(weekdayText).join('、');
-      return preset.every === 1 ? `每${days} ${preset.time}` : `每 ${preset.every} 周的${days} ${preset.time}`;
+      return preset.every === 1
+        ? `每${days} ${preset.time}`
+        : `每 ${preset.every} 周的${days} ${preset.time}`;
     }
     case 'monthly': {
       const day = preset.day === -1 ? '最后一天' : `${preset.day} 日`;
-      return preset.every === 1 ? `每月${day} ${preset.time}` : `每 ${preset.every} 个月的${day} ${preset.time}`;
+      return preset.every === 1
+        ? `每月${day} ${preset.time}`
+        : `每 ${preset.every} 个月的${day} ${preset.time}`;
     }
     case 'custom':
       return '自定义规则';
