@@ -9,6 +9,7 @@ import userEvent, { pickOption } from '../../../test/user';
 import { jsonResponse, ME, renderWithApp, routeFetch } from '../../../test/render';
 import { useConfirmState } from '../../../ui/confirmStore';
 import { useToasts } from '../../../ui/toastStore';
+import { formatDateTime } from '../../../utils/format';
 import { buildRules } from '../../automations/model';
 import AutomationsPage from './AutomationsPage';
 
@@ -20,6 +21,9 @@ afterEach(() => {
 
 const B = '/api/workspaces/default';
 const TZ = 'Asia/Shanghai';
+
+/** 时间按本机时区渲染（utils/format），期望值也走同一个格式化，免得 CI（UTC）与本机只绿一边。 */
+const shown = (iso: string) => formatDateTime(iso);
 
 /** 业务服务给的一条：宿主 entry + 补的 owner、creatorName、origin、lastRun。 */
 const task = (over: Record<string, unknown> = {}) => ({
@@ -86,7 +90,7 @@ describe('管理端自动化审计', () => {
     expect(within(first).getByText('张三')).toBeInTheDocument();
     expect(within(first).getByText('工作日 09:30')).toBeInTheDocument();
     expect(within(first).getByText('运行中')).toBeInTheDocument();
-    expect(first).toHaveTextContent('跑完 · 2026-11-11 09:30');
+    expect(first).toHaveTextContent(`跑完 · ${shown('2026-11-11T01:30:00+00:00')}`);
     expect(within(first).getByRole('link')).toHaveAttribute('href', '/chat/c_chat');
 
     const second = await rowOf('周报汇总');

@@ -10,6 +10,7 @@ import userEvent from '../../test/user';
 import { jsonResponse, ME, renderWithApp, routeFetch } from '../../test/render';
 import { useConfirmState } from '../../ui/confirmStore';
 import { useToasts } from '../../ui/toastStore';
+import { formatDateTime } from '../../utils/format';
 import AutomationsPage from './AutomationsPage';
 import { buildRules, describeRule, type Preset } from './model';
 
@@ -21,6 +22,12 @@ afterEach(() => {
 
 const B = '/api/workspaces/default';
 const TZ = 'Asia/Shanghai';
+
+/**
+ * 页面上显示的时间按本机时区渲染（utils/format 的 formatDateTime），所以期望值也走同一个格式化，
+ * 不写死 '09:30'：CI 跑在 UTC，本机跑在 Asia/Shanghai，写死只会在其中一边绿。
+ */
+const shown = (iso: string) => formatDateTime(iso);
 
 /** 宿主返回的一条任务（业务服务透传 entry，另加 origin）。 */
 const task = (over: Record<string, unknown> = {}) => ({
@@ -79,7 +86,7 @@ describe('自动化页', () => {
     const row = await rowOf('每日站会提醒');
     expect(within(row).getByText('工作日 09:30')).toBeInTheDocument();
     expect(within(row).getByText('运行中')).toBeInTheDocument();
-    expect(within(row).getByText('2026-11-12 09:30')).toBeInTheDocument();
+    expect(within(row).getByText(shown('2026-11-12T01:30:00+00:00'))).toBeInTheDocument();
   });
 
   it('八种时间规则各给一句中文（认不出的说「自定义规则」）', async () => {
@@ -164,7 +171,7 @@ describe('自动化页', () => {
     renderWithApp(<AutomationsPage />, { route: '/automations' });
 
     const row = await rowOf('每日站会提醒');
-    expect(row).toHaveTextContent('跑完 · 2026-11-12 09:30');
+    expect(row).toHaveTextContent(`跑完 · ${shown('2026-11-12T01:30:00+00:00')}`);
     // 「每次新建对话」的任务每一轮都在新对话里：这一下要落到那一次新开的对话
     expect(within(row).getByRole('link')).toHaveAttribute('href', '/chat/c_new');
   });
@@ -185,7 +192,7 @@ describe('自动化页', () => {
     renderWithApp(<AutomationsPage />, { route: '/automations' });
 
     const row = await rowOf('每日站会提醒');
-    expect(row).toHaveTextContent('跳过 · 2026-11-12 09:30');
+    expect(row).toHaveTextContent(`跳过 · ${shown('2026-11-12T01:30:00+00:00')}`);
     expect(within(row).queryByRole('link')).not.toBeInTheDocument();
     // 没有对话可去时，用 title 把「为什么跳过」挂上，鼠标停一下就看得到
     expect(within(row).getByTitle('到点时上一轮还没结束，这一次跳过了')).toBeInTheDocument();
@@ -231,7 +238,8 @@ describe('自动化页', () => {
     // 最新的在最上面，按发生顺序数第 2 次
     expect(within(sheet).getByText('第 2 次')).toBeInTheDocument();
     expect(within(sheet).getByText('第 1 次')).toBeInTheDocument();
-    expect(within(sheet).getAllByText('2026-11-12 09:30')).toHaveLength(2);
+    // 投递时间与计划时间都落在同一分钟的同一格里
+    expect(within(sheet).getAllByText(shown('2026-11-12T01:30:00+00:00'))).toHaveLength(2);
     expect(within(sheet).getAllByText('站会准备')).toHaveLength(2);
     expect(fetch.find('GET', `${B}/automations/schedule-1/history`)).toHaveLength(1);
   });
